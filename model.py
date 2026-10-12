@@ -1,134 +1,160 @@
+# coding:utf-8
 """
-model.py - Neural Network Architectures for Semantic Segmentation
-Defines UNet with checkpointed DoubleConv blocks.
+model.py - MFNet Architecture for RGB + Thermal Semantic Segmentation.
+Paper: MFNet: Towards Real-Time Semantic Segmentation for Autonomous Vehicles
+       with Multi-Spectral Scenes (IROS 2017)
 """
 
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
+import torch.nn.functional as F
 
 # ==========================================
 # Global Parameters / Configuration
 # ==========================================
-IN_CHANNELS = 3
-NUM_CLASSES = 7
-BASE_FEATURES = 32
-USE_GRADIENT_CHECKPOINTING = True
+IN_CHANNELS = 4       # 3 RGB + 1 Thermal
+NUM_CLASSES = 9       # MFNet has 9 classes (0-8)
 
 
-class DoubleConv(nn.Module):
+class ConvBnLeakyRelu2d(nn.Module):
     """
-    Standard Double Convolution Block:
-    [Conv2d -> BatchNorm2d -> ReLU] x 2
+    Convolution -> BatchNorm -> LeakyReLU block.
     """
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        self.act = nn.ReLU(inplace=True)
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, stride=1, dilation=1, groups=1):
+        super(ConvBnLeakyRelu2d, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding, stride=stride, dilation=dilation, groups=groups)
+        self.bn   = nn.BatchNorm2d(out_channels)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.act(self.bn1(self.conv1(x)))
-        x = self.act(self.bn2(self.conv2(x)))
+    def forward(self, x):
+        return F.leaky_relu(self.bn(self.conv(x)), negative_slope=0.2)
+
+
+class MiniInception(nn.Module):
+    """
+    Mini Inception block with parallel dilated convolutions.
+    """
+    def __init__(self, in_channels, out_channels):
+        super(MiniInception, self).__init__()
+        self.conv1_left  = ConvBnLeakyRelu2d(in_channels,   out_channels // 2)
+        self.conv1_right = ConvBnLeakyRelu2d(in_channels,   out_channels // 2, padding=2, dilation=2)
+        self.conv2_left  = ConvBnLeakyRelu2d(out_channels,  out_channels // 2)
+        self.conv2_right = ConvBnLeakyRelu2d(out_channels,  out_channels // 2, padding=2, dilation=2)
+        self.conv3_left  = ConvBnLeakyRelu2d(out_channels,  out_channels // 2)
+        self.conv3_right = ConvBnLeakyRelu2d(out_channels,  out_channels // 2, padding=2, dilation=2)
+
+    def forward(self, x):
+        x = torch.cat((self.conv1_left(x), self.conv1_right(x)), dim=1)
+        x = torch.cat((self.conv2_left(x), self.conv2_right(x)), dim=1)
+        x = torch.cat((self.conv3_left(x), self.conv3_right(x)), dim=1)
         return x
 
 
-class UNet(nn.Module):
+class MFNet(nn.Module):
     """
-    5-stage UNet Architecture with optional Gradient Checkpointing for memory efficiency.
+    Multi-spectral Fusion Network (MFNet).
+    Input:  [B, 4, H, W] where channels 0:3 are RGB and channel 3 is Thermal.
+    Output: [B, n_class, H, W] class segmentation logits.
     """
-    def __init__(
-        self,
-        in_channels: int = IN_CHANNELS,
-        num_classes: int = NUM_CLASSES,
-        base_features: int = BASE_FEATURES,
-        use_checkpoint: bool = USE_GRADIENT_CHECKPOINTING,
-    ):
-        super().__init__()
-        self.use_checkpoint = use_checkpoint
-        f = base_features
 
-        # Encoder stages
-        self.enc_l1 = DoubleConv(in_channels, f)        # 3 -> 32
-        self.enc_l2 = DoubleConv(f, f * 2)             # 32 -> 64
-        self.enc_l3 = DoubleConv(f * 2, f * 4)         # 64 -> 128
-        self.enc_l4 = DoubleConv(f * 4, f * 8)         # 128 -> 256
-        self.enc_l5 = DoubleConv(f * 8, f * 16)        # 256 -> 512
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+    def __init__(self, n_class=NUM_CLASSES):
+        super(MFNet, self).__init__()
+        self.n_class = n_class
+        rgb_ch = [16, 48, 48, 96, 96]
+        inf_ch = [16, 16, 16, 36, 36]
 
-        # Bottleneck
-        self.bot = DoubleConv(f * 16, f * 32)          # 512 -> 1024
+        # RGB Encoder
+        self.conv1_rgb   = ConvBnLeakyRelu2d(3, rgb_ch[0])
+        self.conv2_1_rgb = ConvBnLeakyRelu2d(rgb_ch[0], rgb_ch[1])
+        self.conv2_2_rgb = ConvBnLeakyRelu2d(rgb_ch[1], rgb_ch[1])
+        self.conv3_1_rgb = ConvBnLeakyRelu2d(rgb_ch[1], rgb_ch[2])
+        self.conv3_2_rgb = ConvBnLeakyRelu2d(rgb_ch[2], rgb_ch[2])
+        self.conv4_rgb   = MiniInception(rgb_ch[2], rgb_ch[3])
+        self.conv5_rgb   = MiniInception(rgb_ch[3], rgb_ch[4])
 
-        # Decoder stages
-        self.up_1 = nn.ConvTranspose2d(f * 32, f * 16, kernel_size=2, stride=2)
-        self.dec_l1 = DoubleConv(f * 32, f * 16)       # (512 + 512) -> 512
+        # Thermal (Infrared) Encoder
+        self.conv1_inf   = ConvBnLeakyRelu2d(1, inf_ch[0])
+        self.conv2_1_inf = ConvBnLeakyRelu2d(inf_ch[0], inf_ch[1])
+        self.conv2_2_inf = ConvBnLeakyRelu2d(inf_ch[1], inf_ch[1])
+        self.conv3_1_inf = ConvBnLeakyRelu2d(inf_ch[1], inf_ch[2])
+        self.conv3_2_inf = ConvBnLeakyRelu2d(inf_ch[2], inf_ch[2])
+        self.conv4_inf   = MiniInception(inf_ch[2], inf_ch[3])
+        self.conv5_inf   = MiniInception(inf_ch[3], inf_ch[4])
 
-        self.up_2 = nn.ConvTranspose2d(f * 16, f * 8, kernel_size=2, stride=2)
-        self.dec_l2 = DoubleConv(f * 16, f * 8)        # (256 + 256) -> 256
+        # Fused Decoder
+        self.decode4     = ConvBnLeakyRelu2d(rgb_ch[3] + inf_ch[3], rgb_ch[2] + inf_ch[2])
+        self.decode3     = ConvBnLeakyRelu2d(rgb_ch[2] + inf_ch[2], rgb_ch[1] + inf_ch[1])
+        self.decode2     = ConvBnLeakyRelu2d(rgb_ch[1] + inf_ch[1], rgb_ch[0] + inf_ch[0])
+        self.decode1     = ConvBnLeakyRelu2d(rgb_ch[0] + inf_ch[0], n_class)
 
-        self.up_3 = nn.ConvTranspose2d(f * 8, f * 4, kernel_size=2, stride=2)
-        self.dec_l3 = DoubleConv(f * 8, f * 4)         # (128 + 128) -> 128
+    def forward(self, x):
+        # Split data into RGB and Thermal (INF)
+        x_rgb = x[:, :3]
+        x_inf = x[:, 3:]
 
-        self.up_4 = nn.ConvTranspose2d(f * 4, f * 2, kernel_size=2, stride=2)
-        self.dec_l4 = DoubleConv(f * 4, f * 2)         # (64 + 64) -> 64
+        # Encode RGB
+        x_rgb    = self.conv1_rgb(x_rgb)
+        x_rgb    = F.max_pool2d(x_rgb, kernel_size=2, stride=2)   # pool1
+        x_rgb    = self.conv2_1_rgb(x_rgb)
+        x_rgb_p2 = self.conv2_2_rgb(x_rgb)
+        x_rgb    = F.max_pool2d(x_rgb_p2, kernel_size=2, stride=2) # pool2
+        x_rgb    = self.conv3_1_rgb(x_rgb)
+        x_rgb_p3 = self.conv3_2_rgb(x_rgb)
+        x_rgb    = F.max_pool2d(x_rgb_p3, kernel_size=2, stride=2) # pool3
+        x_rgb_p4 = self.conv4_rgb(x_rgb)
+        x_rgb    = F.max_pool2d(x_rgb_p4, kernel_size=2, stride=2) # pool4
+        x_rgb    = self.conv5_rgb(x_rgb)
 
-        self.up_5 = nn.ConvTranspose2d(f * 2, f, kernel_size=2, stride=2)
-        self.dec_l5 = DoubleConv(f * 2, f)             # (32 + 32) -> 32
+        # Encode Thermal (INF)
+        x_inf    = self.conv1_inf(x_inf)
+        x_inf    = F.max_pool2d(x_inf, kernel_size=2, stride=2)   # pool1
+        x_inf    = self.conv2_1_inf(x_inf)
+        x_inf_p2 = self.conv2_2_inf(x_inf)
+        x_inf    = F.max_pool2d(x_inf_p2, kernel_size=2, stride=2) # pool2
+        x_inf    = self.conv3_1_inf(x_inf)
+        x_inf_p3 = self.conv3_2_inf(x_inf)
+        x_inf    = F.max_pool2d(x_inf_p3, kernel_size=2, stride=2) # pool3
+        x_inf_p4 = self.conv4_inf(x_inf)
+        x_inf    = F.max_pool2d(x_inf_p4, kernel_size=2, stride=2) # pool4
+        x_inf    = self.conv5_inf(x_inf)
 
-        # Final 1x1 conv classifier
-        self.out_layer = nn.Conv2d(f, num_classes, kernel_size=1)
+        # Fusion: concatenate RGB and Thermal feature maps
+        x = torch.cat((x_rgb, x_inf), dim=1)
 
-    def _apply_block(self, block: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        if self.use_checkpoint and self.training and x.requires_grad:
-            return checkpoint(block, x, use_reentrant=False)
-        return block(x)
+        # Decode with skip connections (using F.interpolate for PyTorch compatibility)
+        x = F.interpolate(x, scale_factor=2, mode='nearest') # unpool4
+        x = self.decode4(x + torch.cat((x_rgb_p4, x_inf_p4), dim=1))
+        x = F.interpolate(x, scale_factor=2, mode='nearest') # unpool3
+        x = self.decode3(x + torch.cat((x_rgb_p3, x_inf_p3), dim=1))
+        x = F.interpolate(x, scale_factor=2, mode='nearest') # unpool2
+        x = self.decode2(x + torch.cat((x_rgb_p2, x_inf_p2), dim=1))
+        x = F.interpolate(x, scale_factor=2, mode='nearest') # unpool1
+        x = self.decode1(x)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Encoder
-        enc1 = self._apply_block(self.enc_l1, x)
-        enc2 = self._apply_block(self.enc_l2, self.pool(enc1))
-        enc3 = self._apply_block(self.enc_l3, self.pool(enc2))
-        enc4 = self._apply_block(self.enc_l4, self.pool(enc3))
-        enc5 = self._apply_block(self.enc_l5, self.pool(enc4))
-
-        # Bottleneck
-        bot = self._apply_block(self.bot, self.pool(enc5))
-
-        # Decoder with skip connections
-        dec1 = self.up_1(bot)
-        dec1 = torch.cat([dec1, enc5], dim=1)
-        dec1 = self._apply_block(self.dec_l1, dec1)
-
-        dec2 = self.up_2(dec1)
-        dec2 = torch.cat([dec2, enc4], dim=1)
-        dec2 = self._apply_block(self.dec_l2, dec2)
-
-        dec3 = self.up_3(dec2)
-        dec3 = torch.cat([dec3, enc3], dim=1)
-        dec3 = self._apply_block(self.dec_l3, dec3)
-
-        dec4 = self.up_4(dec3)
-        dec4 = torch.cat([dec4, enc2], dim=1)
-        dec4 = self._apply_block(self.dec_l4, dec4)
-
-        dec5 = self.up_5(dec4)
-        dec5 = torch.cat([dec5, enc1], dim=1)
-        dec5 = self._apply_block(self.dec_l5, dec5)
-
-        # Output logits: [B, num_classes, H, W]
-        out = self.out_layer(dec5)
-        return out
+        return x
 
 
 def build_model(
-    in_channels: int = IN_CHANNELS,
     num_classes: int = NUM_CLASSES,
-    use_checkpoint: bool = USE_GRADIENT_CHECKPOINTING,
+    **kwargs,
 ) -> nn.Module:
-    return UNet(
-        in_channels=in_channels,
-        num_classes=num_classes,
-        use_checkpoint=use_checkpoint,
-    )
+    """
+    Build and return the MFNet segmentation model.
+    """
+    return MFNet(n_class=num_classes)
+
+
+def unit_test():
+    import numpy as np
+    x = torch.tensor(np.random.rand(2, 4, 480, 640).astype(np.float32))
+    model = MFNet(n_class=NUM_CLASSES)
+    y = model(x)
+    print('MFNet output shape:', y.shape)
+    assert y.shape == (2, NUM_CLASSES, 480, 640), f'output shape (2,{NUM_CLASSES},480,640) is expected!'
+    print('MFNet unit test passed!')
+    
+    print("model")
+    print(model)
+
+
+if __name__ == '__main__':
+    unit_test()

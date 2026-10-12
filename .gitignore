@@ -1,0 +1,9 @@
+checkpoints/
+plots/
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+*.pt
+*.pth
+MFNet_dataset/
