@@ -256,22 +256,76 @@ class MulticlassDiceLoss(nn.Module):
         return 1.0 - dice.mean()
 
 
+# Precomputed pixel frequencies from the 1,568 training images of the MFNet dataset
+MFNET_CLASS_COUNTS = [
+    442504816,  # 0: Unlabeled / Background (91.87%)
+    21804852,   # 1: Car                   (4.53%)
+    6648728,    # 2: Person                (1.38%)
+    2055576,    # 3: Bike                  (0.43%)
+    3097628,    # 4: Curve                 (0.64%)
+    2627332,    # 5: Car Stop              (0.55%)
+    727236,     # 6: Guardrail             (0.15%)
+    844474,     # 7: Color Cone            (0.18%)
+    1378958,    # 8: Bump                  (0.29%)
+]
+
+
+def get_class_weights(
+    method: str = "auto",
+    num_classes: int = NUM_CLASSES,
+    device: str = DEVICE,
+) -> Optional[torch.Tensor]:
+    """
+    Computes class weights for CrossEntropyLoss to address severe class imbalance.
+
+    Methods:
+      - 'auto' / 'power': Inverse cube-root frequency: (1 / f_c)^(1/3),
+                          normalized so mean=1.0. Smooth and stable.
+      - 'mfb': Median Frequency Balancing: median(f) / f_c, clamped to [0.05, 10.0].
+      - 'enet': ENet log-smoothing: 1 / ln(1.10 + f_c), normalized so mean=1.0.
+      - 'none': Unweighted (returns None).
+    """
+    if method == "none" or method is None:
+        return None
+
+    counts = np.array(MFNET_CLASS_COUNTS[:num_classes], dtype=np.float64)
+    freqs = counts / counts.sum()
+
+    if method in ("auto", "power"):
+        w = (1.0 / np.maximum(freqs, 1e-6)) ** (1.0 / 3.0)
+        w = w / w.mean()
+    elif method == "mfb":
+        med = np.median(freqs)
+        w = med / np.maximum(freqs, 1e-6)
+        w = np.clip(w, 0.05, 10.0)
+        w = w / w.mean()
+    elif method == "enet":
+        w = 1.0 / np.log(1.10 + freqs)
+        w = w / w.mean()
+    else:
+        raise ValueError(f"Unknown class_weights method: {method}")
+
+    return torch.tensor(w, dtype=torch.float32, device=device)
+
+
 class CombinedLoss(nn.Module):
-    """Combined Cross-Entropy + Dice Loss."""
+    """Combined Weighted Cross-Entropy + Dice Loss."""
 
     def __init__(
         self,
         num_classes: int = NUM_CLASSES,
         ignore_index: Optional[int] = IGNORE_INDEX,
+        class_weights: Optional[torch.Tensor] = None,
         ce_weight: float = 1.0,
         dice_weight: float = 1.0,
     ):
         super().__init__()
         ce_ign = ignore_index if ignore_index is not None else -100
-        self.ce          = nn.CrossEntropyLoss(ignore_index=ce_ign)
+        self.ce          = nn.CrossEntropyLoss(weight=class_weights, ignore_index=ce_ign)
         self.dice        = MulticlassDiceLoss(num_classes=num_classes, ignore_index=ignore_index)
         self.ce_weight   = ce_weight
         self.dice_weight = dice_weight
+        self.class_weights = class_weights
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         return self.ce_weight * self.ce(logits, targets) + \
@@ -813,6 +867,11 @@ def parse_args():
     parser.add_argument("--img-w",          type=int, default=640)
     parser.add_argument("--vis-samples",    type=int, default=4,
                         help="Number of samples (4-8) to visualize after each epoch (image, thermal_image, predicted_mask, true_label)")
+    parser.add_argument("--class-weights",  type=str, default="auto",
+                        choices=["auto", "mfb", "enet", "none"],
+                        help="CrossEntropyLoss weighting scheme: 'auto' (cube-root inverse freq), "
+                             "'mfb' (median frequency balancing), 'enet' (ENet log-smoothed), "
+                             "or 'none' (unweighted)")
     return parser.parse_args()
 
 
@@ -844,7 +903,22 @@ def main():
     # 2. Optimizer, scheduler, loss
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-    criterion = CombinedLoss(num_classes=NUM_CLASSES, ignore_index=IGNORE_INDEX)
+
+    class_weights = get_class_weights(method=args.class_weights, num_classes=NUM_CLASSES, device=device)
+    if class_weights is not None:
+        print(f"\nWeighted CrossEntropyLoss ({args.class_weights}):")
+        for i, name in enumerate(CLASS_NAMES):
+            w_val = class_weights[i].item() if i < len(class_weights) else 1.0
+            print(f"  Class {i} ({name:12s}): weight = {w_val:.4f}")
+        print()
+    else:
+        print("\nUsing unweighted CrossEntropyLoss.\n")
+
+    criterion = CombinedLoss(
+        num_classes=NUM_CLASSES,
+        ignore_index=IGNORE_INDEX,
+        class_weights=class_weights,
+    )
 
     # 3. Resume
     start_epoch    = 1
