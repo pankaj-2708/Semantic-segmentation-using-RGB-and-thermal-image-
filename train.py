@@ -800,6 +800,12 @@ def parse_args():
                         help="Path to MFNet dataset root")
     parser.add_argument("--resume",     type=str,   default=None,
                         help="Checkpoint path to resume from")
+    parser.add_argument("--lr-mode",    type=str,   default="rescale",
+                        choices=["rescale", "keep_min", "restart"],
+                        help="LR behavior on resume with increased epochs: "
+                             "'rescale' (adjust cosine curve to new total epochs), "
+                             "'keep_min' (keep LR fixed at minimum 1e-6 for fine-tuning), "
+                             "'restart' (fresh cosine decay over remaining epochs)")
     parser.add_argument("--checkpoint-dir", type=str, default=CHECKPOINT_DIR)
     parser.add_argument("--plot-dir",       type=str, default=PLOT_DIR)
     parser.add_argument("--num-workers",    type=int, default=2)
@@ -852,6 +858,23 @@ def main():
             filepath=args.resume, model=model, optimizer=optimizer,
             scheduler=scheduler, device=device,
         )
+
+        remaining_epochs = max(1, epochs - start_epoch + 1)
+        if args.lr_mode == "keep_min":
+            print(f"[train.py] LR Mode 'keep_min': keeping LR fixed at minimum (1e-6) for fine-tuning.")
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = 1e-6
+            scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=remaining_epochs)
+        elif args.lr_mode == "restart":
+            restart_lr = args.lr if args.lr != LEARNING_RATE else 1e-4
+            print(f"[train.py] LR Mode 'restart': starting fresh Cosine decay from {restart_lr} over remaining {remaining_epochs} epochs.")
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = restart_lr
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_epochs, eta_min=1e-6)
+        else:  # "rescale" (default)
+            if scheduler is not None and hasattr(scheduler, "T_max"):
+                print(f"[train.py] LR Mode 'rescale': updating scheduler T_max to total epochs={epochs}")
+                scheduler.T_max = epochs
 
     # 4. DataLoaders
     if get_dataloaders is None:
