@@ -32,11 +32,12 @@ from torch.utils.data import DataLoader
 
 # Import modular components
 try:
-    import my_model as model_module
-    from my_model import build_model
+    import model as model_module
+    from model import MFNet, build_model
 except ImportError as e:
-    print(f"[Warning] Could not import my_model: {e}")
+    print(f"[Warning] Could not import model: {e}")
     model_module = None
+    MFNet = None
     build_model = None
 
 try:
@@ -57,14 +58,14 @@ TQDM_SMOOTHING    = 0.1
 NUM_CLASSES   = 9          # MFNet: 0=Unlabeled, 1-8 objects
 IN_CHANNELS   = 4          # RGB (3) + Thermal (1)
 IGNORE_INDEX  = 255
-BATCH_SIZE    = 2
+BATCH_SIZE    = 24
 EPOCHS        = 50
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY  = 1e-4
-ARCH          = "custom_dual_unet_attention"
+ARCH          = "mfnet"
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 
-CHECKPOINT_DIR    = "checkpoints/custom_dual_unet_attention"
+CHECKPOINT_DIR    = "checkpoints"
 PLOT_DIR          = "plots"
 BEST_METRIC_NAME  = "miou"   # "miou" or "loss"
 
@@ -844,11 +845,11 @@ def train(
 # Argument Parsing & Main
 # ==============================================================================
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train custom RGB+thermal semantic segmentation model on MFNet")
+    parser = argparse.ArgumentParser(description="Train MFNet RGB+Thermal Segmentation")
     parser.add_argument("--epochs",     type=int,   default=EPOCHS,        help="Training epochs")
     parser.add_argument("--batch-size", type=int,   default=BATCH_SIZE,    help="Batch size")
     parser.add_argument("--lr",         type=float, default=LEARNING_RATE, help="Learning rate")
-    parser.add_argument("--arch",       type=str,   default="custom_dual_unet_attention", choices=["custom_dual_unet_attention"], help="Custom dual-stream U-Net with multi-scale cross-modal attention")
+    parser.add_argument("--arch",       type=str,   default="mfnet",       choices=["mfnet"], help="Architecture (MFNet)")
     parser.add_argument("--data-root",  type=str,   default=DEFAULT_DATA_ROOT,
                         help="Path to MFNet dataset root")
     parser.add_argument("--resume",     type=str,   default=None,
@@ -886,18 +887,18 @@ def main():
     img_size     = (args.img_h, args.img_w)
 
     print("=" * 70)
-    print("Custom Dual-Stream U-Net + Multi-Scale Cross-Modal Attention")
-    print(f"  Model={args.arch} | device={device} | batch={batch_size} | epochs={epochs} | lr={lr}")
+    print("MFNet RGB+Thermal Semantic Segmentation Training")
+    print(f"  Model=MFNet | device={device} | batch={batch_size} | epochs={epochs} | lr={lr}")
     print(f"  img_size={img_size} | num_classes={NUM_CLASSES}")
     print("=" * 70)
 
-    # 1. Build our custom model (input: RGB + thermal; output: 9-class logits)
+    # 1. Build model (MFNet)
     if build_model is None:
-        raise RuntimeError("Cannot import build_model from my_model.py")
-    model = build_model(num_classes=NUM_CLASSES, in_channels=IN_CHANNELS)
+        raise RuntimeError("Cannot import build_model from model.py")
+    model = build_model(num_classes=NUM_CLASSES)
     model = model.to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: CustomDualStreamUNet | Trainable params: {n_params:,}")
+    print(f"Model: MFNet | Trainable params: {n_params:,}")
 
     # 2. Optimizer, scheduler, loss
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
