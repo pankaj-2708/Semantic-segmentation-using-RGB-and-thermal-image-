@@ -1,0 +1,24 @@
+===== train19 started 2026-10-13 10:38:24 =====
+Python 3.13.1 | torch 2.13.0+cu126 | CUDA build 12.6 | cuda available: True
+torchvision 0.28.0+cu126
+GPU: NVIDIA GeForce RTX 3050 Laptop GPU | 4.0 GiB | compute capability 8.6
+AMP (fp16 autocast): True | seed 42 | miou policy: all9 (all9 = class 0 included) | loss = 1.0*CE + 0.0*Dice
+Pretrained: requested=True loaded=True -> ImageNet weights loaded from torchvision ResNet18_Weights.IMAGENET1K_V1
+Parameters: 30,995,525 total (30,995,525 trainable) | RGB enc 11,176,512 | thermal enc 11,170,240 | decoder 8,648,773
+Training: 784 train / 392 val samples | batch 1 x accum 8 = effective 8 | optimizer sgd lr 0.01 | epochs 1..100
+Epoch   1/100 | train loss 0.8522 | val loss 0.3989 | val mIoU(9) 12.89% mIoU(1-8) 2.91% | pixAcc 92.04% | Dice(9) 15.21% | lr 1.00e-02 | 0:02:46 (elapsed 0:02:47, ETA 4:36:08)  * new best
+Epoch   2/100 | train loss 0.3931 | val loss 0.3648 | val mIoU(9) 13.34% mIoU(1-8) 3.39% | pixAcc 92.01% | Dice(9) 15.88% | lr 9.50e-03 | 0:02:15 (elapsed 0:05:09, ETA 4:12:57)  * new best
+Epoch   3/100 | train loss 0.3610 | val loss 0.3606 | val mIoU(9) 13.35% mIoU(1-8) 3.41% | pixAcc 91.80% | Dice(9) 15.81% | lr 9.03e-03 | 0:02:14 (elapsed 0:07:25, ETA 4:00:09)  * new best
+Epoch   4/100 | train loss 0.3413 | val loss 0.3459 | val mIoU(9) 14.02% mIoU(1-8) 4.12% | pixAcc 91.91% | Dice(9) 16.89% | lr 8.57e-03 | 0:02:18 (elapsed 0:09:45, ETA 3:54:11)  * new best
+Epoch   5/100 | train loss 0.3313 | val loss 0.3451 | val mIoU(9) 13.22% mIoU(1-8) 3.25% | pixAcc 92.28% | Dice(9) 15.72% | lr 8.15e-03 | 0:02:08 (elapsed 0:11:55, ETA 3:46:25)
+Epoch   6/100 | train loss 0.3178 | val loss 0.3296 | val mIoU(9) 13.80% mIoU(1-8) 3.85% | pixAcc 92.49% | Dice(9) 16.60% | lr 7.74e-03 | 0:02:05 (elapsed 0:14:04, ETA 3:40:23)
+Epoch   7/100 | train loss 0.3092 | val loss 0.4245 | val mIoU(9) 13.11% mIoU(1-8) 3.30% | pixAcc 89.20% | Dice(9) 15.80% | lr 7.35e-03 | 0:02:07 (elapsed 0:16:12, ETA 3:35:21)
+Epoch   8/100 | train loss 0.3016 | val loss 0.3318 | val mIoU(9) 14.61% mIoU(1-8) 4.72% | pixAcc 92.23% | Dice(9) 17.75% | lr 6.98e-03 | 0:02:41 (elapsed 0:18:56, ETA 3:37:44)  * new best
+Epoch   9/100 | train loss 0.2937 | val loss 0.3318 | val mIoU(9) 14.29% mIoU(1-8) 4.35% | pixAcc 92.36% | Dice(9) 17.33% | lr 6.63e-03 | 0:02:05 (elapsed 0:21:03, ETA 3:32:51)
+Epoch  10/100 | train loss 0.2855 | val loss 0.3328 | val mIoU(9) 13.93% mIoU(1-8) 4.01% | pixAcc 92.74% | Dice(9) 16.86% | lr 6.30e-03 | 0:02:06 (elapsed 0:23:11, ETA 3:28:43)
+Epoch  11/100 | train loss 0.2792 | val loss 0.3297 | val mIoU(9) 14.49% mIoU(1-8) 4.52% | pixAcc 92.30% | Dice(9) 17.54% | lr 5.99e-03 | 0:02:38 (elapsed 0:25:53, ETA 3:29:27)
+Epoch  12/100 | train loss 0.2724 | val loss 0.3278 | val mIoU(9) 14.40% mIoU(1-8) 4.43% | pixAcc 92.32% | Dice(9) 17.44% | lr 5.69e-03 | 0:03:09 (elapsed 0:29:03, ETA 3:33:04)
+Epoch  13/100 | train loss 0.2666 | val loss 0.3211 | val mIoU(9) 13.48% mIoU(1-8) 3.41% | pixAcc 92.43% | Dice(9) 16.09% | lr 5.40e-03 | 0:03:18 (elapsed 0:32:22, ETA 3:36:41)
+Epoch  14/100 | train loss 0.2609 | val loss 0.3342 | val mIoU(9) 14.55% mIoU(1-8) 4.70% | pixAcc 92.90% | Dice(9) 17.75% | lr 5.13e-03 | 0:04:35 (elapsed 0:37:00, ETA 3:47:20)
+Epoch  15/100 | train loss 0.2541 | val loss 0.3395 | val mIoU(9) 14.28% mIoU(1-8) 4.42% | pixAcc 92.75% | Dice(9) 17.39% | lr 4.88e-03 | 0:01:48 (elapsed 0:38:51, ETA 3:40:11)
+Interrupted by user. last.pth (if any) can be resumed with --resume.
