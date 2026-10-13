@@ -1,9 +1,10 @@
-checkpoints/
-plots/
+# Ignore epoch checkpoints but allow best checkpoint
+checkpoints/ckpt_epoch_*.pt
+checkpoints/last_checkpoint.pt
 __pycache__/
 *.py[cod]
 *$py.class
 .ipynb_checkpoints/
-*.pt
 *.pth
 MFNet_dataset/
+.venv/
