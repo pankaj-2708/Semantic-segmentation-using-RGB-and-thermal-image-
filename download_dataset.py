@@ -42,7 +42,7 @@ def try_gdown(output_dir: str) -> bool:
             output=output_dir,
             quiet=False,
             use_cookies=False,
-            remaining_ok=True,
+            # remaining_ok=True,
         )
         if result:
             print(f"[downloader] gdown succeeded: {result}")
