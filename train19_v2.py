@@ -116,6 +116,30 @@ def sync(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def device_tag(device: torch.device) -> str:
+    """Short label used in live progress bars so CPU/GPU use is always visible."""
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return "CPU"
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    name = torch.cuda.get_device_name(idx).replace("NVIDIA GeForce ", "")
+    return f"GPU:{name}"
+
+
+def live_device_status(device: torch.device) -> str:
+    """Low-overhead live device indicator; reports current allocated/reserved VRAM on CUDA."""
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return "CPU active"
+    try:
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(idx)
+        allocated = torch.cuda.memory_allocated(idx) / (1024 ** 3)
+        reserved = torch.cuda.memory_reserved(idx) / (1024 ** 3)
+        total = props.total_memory / (1024 ** 3)
+        return f"GPU VRAM {allocated:.1f}/{total:.1f}G alloc; {reserved:.1f}G reserved"
+    except Exception:
+        return f"{device_tag(device)} active"
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
@@ -352,7 +376,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_amp
     optimizer.zero_grad(set_to_none=True)
     loss_sum = torch.zeros((), device=device)
     n_seen, t0 = 0, time.perf_counter()
-    bar = progress(loader, total=n_batches, desc=f"train {epoch}/{epochs}")
+    bar = progress(loader, total=n_batches, desc=f"train {epoch}/{epochs} [{device_tag(device)}]")
     plain = not hasattr(bar, "set_postfix")
     for it, (rgb, thermal, target) in enumerate(bar):
         rgb = rgb.to(device, non_blocking=True)
@@ -380,10 +404,10 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, use_amp
                 raise FloatingPointError(f"non-finite training loss at epoch {epoch}, iteration {it}. "
                                          "Try a lower --lr, --grad-clip 1.0 or --amp off.")
             if not plain:
-                bar.set_postfix(loss=f"{cur:.4f}")
+                bar.set_postfix(loss=f"{cur:.4f}", device=live_device_status(device))
             elif (it + 1) % log_interval == 0 or it + 1 == n_batches:
                 print(f"  train {epoch}/{epochs} [{it + 1}/{n_batches}] loss {cur:.4f} "
-                      f"({time.perf_counter() - t0:.0f}s)", flush=True)
+                      f"device={live_device_status(device)} ({time.perf_counter() - t0:.0f}s)", flush=True)
     if hasattr(bar, "close"):
         bar.close()
     return float(loss_sum) / max(n_seen, 1)
@@ -394,8 +418,8 @@ def evaluate(model, loader, criterion, device, use_amp, desc="val") -> Dict[str,
     model.eval()
     conf = torch.zeros(NUM_CLASSES, NUM_CLASSES, dtype=torch.int64, device=device)
     loss_sum, n_seen = torch.zeros((), device=device), 0
-    bar = progress(loader, total=len(loader), desc=desc)
-    for rgb, thermal, target in bar:
+    bar = progress(loader, total=len(loader), desc=f"{desc} [{device_tag(device)}]")
+    for batch_idx, (rgb, thermal, target) in enumerate(bar):
         rgb = rgb.to(device, non_blocking=True)
         thermal = thermal.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
@@ -405,6 +429,8 @@ def evaluate(model, loader, criterion, device, use_amp, desc="val") -> Dict[str,
         update_confusion(conf, logits.argmax(1), target)
         loss_sum += loss.detach() * rgb.shape[0]
         n_seen += rgb.shape[0]
+        if hasattr(bar, "set_postfix") and ((batch_idx + 1) % 20 == 0 or batch_idx + 1 == len(loader)):
+            bar.set_postfix(loss=f"{float(loss.detach()):.4f}", device=live_device_status(device))
     if hasattr(bar, "close"):
         bar.close()
     conf_np = conf.cpu().numpy()
@@ -486,6 +512,85 @@ def plot_curves(history: Dict[str, list], path: Path, select_metric: str) -> Non
         log(f"WARNING: could not save training curves: {exc}")
 
 
+def plot_iou_history(history: Dict[str, list], path: Path) -> None:
+    """Heatmap of validation IoU for every class across epochs."""
+    plt = _plt()
+    if plt is None or not history.get("val_iou_per_class"):
+        return
+    try:
+        values = np.asarray([
+            [np.nan if v is None or (isinstance(v, float) and math.isnan(v)) else float(v) for v in row]
+            for row in history["val_iou_per_class"]
+        ], dtype=float).T
+        fig_h = max(4.5, 0.48 * NUM_CLASSES + 1.4)
+        fig, ax = plt.subplots(figsize=(max(10, min(20, len(history["epoch"]) * 0.16)), fig_h))
+        im = ax.imshow(values * 100.0, aspect="auto", interpolation="nearest", cmap="viridis", vmin=0, vmax=100)
+        ax.set_yticks(range(NUM_CLASSES)); ax.set_yticklabels([f"{i} {n}" for i, n in enumerate(ds2.CLASS_NAMES)])
+        epochs = history["epoch"]
+        tick_idx = np.unique(np.linspace(0, len(epochs) - 1, num=min(12, len(epochs))).round().astype(int))
+        ax.set_xticks(tick_idx); ax.set_xticklabels([epochs[i] for i in tick_idx])
+        ax.set_xlabel("Epoch"); ax.set_title("Validation IoU by class across training (%)")
+        fig.colorbar(im, ax=ax, label="IoU %", fraction=0.025, pad=0.02)
+        fig.tight_layout(); path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(path, dpi=125); plt.close(fig)
+    except Exception as exc:  # noqa: BLE001
+        log(f"WARNING: could not save per-class IoU history: {exc}")
+
+
+def plot_confusion_counts(conf: np.ndarray, path: Path, title: str) -> None:
+    """Raw confusion counts displayed on log scale, complementary to row-normalised confusion."""
+    plt = _plt()
+    if plt is None:
+        return
+    try:
+        counts = np.asarray(conf, dtype=np.float64)
+        values = np.log10(counts + 1.0)
+        fig, ax = plt.subplots(figsize=(10, 8))
+        im = ax.imshow(values, cmap="magma", interpolation="nearest")
+        ax.set_xticks(range(NUM_CLASSES)); ax.set_yticks(range(NUM_CLASSES))
+        ax.set_xticklabels([f"{i} {n}" for i, n in enumerate(ds2.CLASS_NAMES)], rotation=45, ha="right", fontsize=8)
+        ax.set_yticklabels([f"{i} {n}" for i, n in enumerate(ds2.CLASS_NAMES)], fontsize=8)
+        ax.set_xlabel("Predicted class"); ax.set_ylabel("Ground-truth class"); ax.set_title(title)
+        for i in range(NUM_CLASSES):
+            for j in range(NUM_CLASSES):
+                val = int(counts[i, j])
+                if val:
+                    ax.text(j, i, f"{val:,}", ha="center", va="center", fontsize=6,
+                            color="white" if values[i, j] > values.max() * 0.55 else "black")
+        fig.colorbar(im, ax=ax, label="log10(count + 1)", fraction=0.046)
+        fig.tight_layout(); path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(path, dpi=125); plt.close(fig)
+    except Exception as exc:  # noqa: BLE001
+        log(f"WARNING: could not save raw confusion counts: {exc}")
+
+
+def plot_classwise_metrics(m: Dict[str, object], path: Path, title: str) -> None:
+    """Readable 2x2 per-class IoU/Dice/recall/precision dashboard."""
+    plt = _plt()
+    if plt is None:
+        return
+    try:
+        metrics = [("iou_per_class", "IoU (%)"), ("dice_per_class", "Dice (%)"),
+                   ("recall_per_class", "Recall (%)"), ("precision_per_class", "Precision (%)")]
+        x = np.arange(NUM_CLASSES)
+        colors = [ds2.PALETTE[i] / 255.0 for i in range(NUM_CLASSES)]
+        fig, axes = plt.subplots(2, 2, figsize=(15, 9))
+        for ax, (key, subtitle) in zip(axes.flat, metrics):
+            vals = np.array([0.0 if v is None or (isinstance(v, float) and math.isnan(v)) else 100 * float(v)
+                             for v in m[key]])
+            bars = ax.bar(x, vals, color=colors, edgecolor="black", linewidth=0.35)
+            ax.set_xticks(x); ax.set_xticklabels([f"{i}\n{ds2.CLASS_NAMES[i].split('/')[0]}" for i in x], fontsize=8)
+            ax.set_ylim(0, 100); ax.set_ylabel(subtitle); ax.set_title(subtitle)
+            ax.grid(axis="y", alpha=0.25)
+            for bar, value in zip(bars, vals):
+                if value >= 3:
+                    ax.text(bar.get_x() + bar.get_width()/2, value + 1, f"{value:.0f}", ha="center", va="bottom", fontsize=7)
+        fig.suptitle(title, fontsize=14); fig.tight_layout(rect=(0, 0, 1, 0.96))
+        path.parent.mkdir(parents=True, exist_ok=True); fig.savefig(path, dpi=125); plt.close(fig)
+    except Exception as exc:  # noqa: BLE001
+        log(f"WARNING: could not save per-class metric dashboard: {exc}")
+
+
 def plot_pred_distribution(m: Dict[str, object], path: Path, title: str) -> None:
     """Ground-truth vs predicted pixel share per class (log y) + per-class IoU."""
     plt = _plt()
@@ -512,27 +617,62 @@ def plot_pred_distribution(m: Dict[str, object], path: Path, title: str) -> None
 @torch.no_grad()
 def save_prediction_grid(model, dataset, indices: Sequence[int], path: Path, device, use_amp, title: str,
                          thermal_mean: float, thermal_std: float) -> None:
+    """Save detailed, easy-to-read RGB-T segmentation results with overlays and confidence."""
     plt = _plt()
     if plt is None:
         return
     try:
         model.eval()
         n = len(indices)
-        fig, axes = plt.subplots(n, 4, figsize=(16, 3.6 * n + 1.0), squeeze=False)
+        if n == 0:
+            return
+        panel_names = ["RGB", "Thermal", "Ground truth", "Prediction", "Prediction overlay",
+                       "Error map", "Max-class confidence"]
+        fig, axes = plt.subplots(n, len(panel_names), figsize=(25, 3.7 * n + 1.2), squeeze=False)
         for r, idx in enumerate(indices):
             rgb, th, y = dataset[idx]
             with autocast(device, use_amp):
-                pred = model(rgb[None].to(device), th[None].to(device)).argmax(1)[0].cpu()
-            panels = [(ds2.denormalize_rgb(rgb), None), (ds2.denormalize_thermal(th, thermal_mean, thermal_std), "gray"),
-                      (ds2.colorize_mask(y), None), (ds2.colorize_mask(pred), None)]
-            heads = ["RGB", "Thermal", "Ground truth", "Prediction"]
-            for c, ((img, cm), head) in enumerate(zip(panels, heads)):
-                axes[r, c].imshow(img, cmap=cm); axes[r, c].axis("off")
-                axes[r, c].set_title(head + (f"  [{dataset.sample_name(idx)}]" if c == 0 else ""), fontsize=9)
-        fig.legend(handles=ds2.legend_handles(), loc="lower center", ncol=5, fontsize=9, frameon=False)
-        fig.suptitle(title, fontsize=12)
-        fig.tight_layout(rect=(0, 0.07, 1, 0.97)); path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(path, dpi=95); plt.close(fig)
+                logits = model(rgb[None].to(device), th[None].to(device)).float()
+                probs = logits.softmax(1)[0]
+                confidence, pred = probs.max(0)
+                pred = pred.cpu()
+                confidence = confidence.cpu().numpy()
+            rgb_u8 = ds2.denormalize_rgb(rgb)
+            th_u8 = ds2.denormalize_thermal(th, thermal_mean, thermal_std)
+            gt_np = y.detach().cpu().numpy().astype(np.int64)
+            pred_np = pred.numpy().astype(np.int64)
+            gt_rgb = ds2.colorize_mask(y)
+            pred_rgb = ds2.colorize_mask(pred)
+            overlay = rgb_u8.copy()
+            fg_pred = (pred_np > 0) & (pred_np < NUM_CLASSES)
+            if np.any(fg_pred):
+                overlay[fg_pred] = (0.52 * rgb_u8[fg_pred] + 0.48 * pred_rgb[fg_pred]).astype(np.uint8)
+            # Green = correctly predicted labelled foreground; red = wrong/missed foreground;
+            # blue = non-zero prediction where the target says class 0 (unlabeled/background).
+            err = np.zeros((*gt_np.shape, 3), dtype=np.uint8)
+            err[gt_np == 0] = (36, 36, 36)
+            foreground = (gt_np > 0) & (gt_np < NUM_CLASSES)
+            correct_fg = foreground & (pred_np == gt_np)
+            missed_fg = foreground & (pred_np == 0)
+            wrong_fg = foreground & (pred_np > 0) & (pred_np != gt_np)
+            bg_nonzero = (gt_np == 0) & (pred_np > 0)
+            err[correct_fg] = (40, 210, 95)
+            err[missed_fg] = (255, 160, 0)
+            err[wrong_fg] = (235, 55, 65)
+            err[bg_nonzero] = (40, 155, 255)
+            err[gt_np == IGNORE_INDEX] = (255, 255, 255)
+            panels = [(rgb_u8, None), (th_u8, "gray"), (gt_rgb, None), (pred_rgb, None),
+                      (overlay, None), (err, None), (confidence, "magma")]
+            for c, ((img, cm), head) in enumerate(zip(panels, panel_names)):
+                axes[r, c].imshow(img, cmap=cm, vmin=0 if cm == "magma" else None,
+                                  vmax=1 if cm == "magma" else None)
+                axes[r, c].axis("off")
+                axes[r, c].set_title(head + (f" [{dataset.sample_name(idx)}]" if c == 0 else ""), fontsize=8)
+        fig.legend(handles=ds2.legend_handles(), loc="lower center", ncol=5, fontsize=8, frameon=False)
+        fig.suptitle(title + " | error: green=correct FG, orange=missed FG, red=wrong FG, blue=class-0 disagreement",
+                     fontsize=11)
+        fig.tight_layout(rect=(0, 0.07, 1, 0.94)); path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(path, dpi=100); plt.close(fig)
     except Exception as exc:  # noqa: BLE001
         log(f"WARNING: could not save prediction grid: {exc}")
 
@@ -566,7 +706,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train/evaluate RTFNet18V2 on MFNet RGB-T",
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     g = p.add_argument_group("data")
-    g.add_argument("--data-root", default=None, help="default: ../MFNet_CMX next to this repo")
+    g.add_argument("--data-root", default=None, help="default: auto-detect sibling ../MFNet_dataset (Kaggle raw) first, then ../MFNet_CMX (prepared)")
     g.add_argument("--img-size", type=int, nargs=2, metavar=("H", "W"), default=[480, 640])
     g.add_argument("--batch-size", type=int, default=2, help="official RTFNet uses 2; on a 4 GB GPU use 1 if OOM")
     g.add_argument("--accum-steps", type=int, default=4, help="effective batch = batch-size x accum-steps")
@@ -732,13 +872,24 @@ def evaluate_checkpoint(args, ckpt_path: Path, split: str, device, use_amp, data
            "model_info": ckpt.get("model_info"), "args": {k: v for k, v in vars(args).items()}}
     with open(ckpt_dir / f"{split}_results.json", "w", encoding="utf-8") as f:
         json.dump(nan_to_none(out), f, indent=2, default=str)
-    plot_confusion(res["conf"], plots_dir / f"{split}_confusion_matrix.png", f"{split} confusion matrix ({ckpt_path.name})")
+    plot_confusion(res["conf"], plots_dir / f"{split}_confusion_matrix.png", f"{split} row-normalised confusion ({ckpt_path.name})")
+    plot_confusion_counts(res["conf"], plots_dir / f"{split}_confusion_counts.png", f"{split} raw confusion counts ({ckpt_path.name})")
     plot_pred_distribution(m, plots_dir / f"{split}_pred_distribution.png", f"{split}: ground truth vs predicted pixel share ({ckpt_path.name})")
+    plot_classwise_metrics(m, plots_dir / f"{split}_classwise_metrics.png", f"{split}: per-class segmentation metrics")
+    # A tidy per-class table is useful for the report and model-to-model comparison.
+    class_csv = ckpt_dir / f"{split}_class_metrics.csv"
+    with open(class_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["class_id", "class_name", "IoU", "Dice", "Recall", "Precision", "GT_share", "Pred_share"])
+        for cid, cname in enumerate(ds2.CLASS_NAMES):
+            writer.writerow([cid, cname, m["iou_per_class"][cid], m["dice_per_class"][cid],
+                             m["recall_per_class"][cid], m["precision_per_class"][cid],
+                             m["gt_share"][cid], m["pred_share"][cid]])
     ds = datasets[split]
     idx = np.unique(np.linspace(0, len(ds) - 1, num=args.vis_samples).round().astype(int)).tolist()
     save_prediction_grid(model, ds, idx, plots_dir / f"{split}_predictions.png", device, use_amp,
                          f"{split} predictions ({ckpt_path.name})", *thermal)
-    log(f"Saved {ckpt_dir / (split + '_results.json')} and plots in {plots_dir}")
+    log(f"Saved {ckpt_dir / (split + '_results.json')}, {class_csv}, and visualizations in {plots_dir}")
     out["_seconds"] = sec
     return out
 
@@ -882,7 +1033,9 @@ def run_sanity(args, device, use_amp) -> int:
         info = state["info"]
         with tempfile.TemporaryDirectory() as td:
             out = Path(td) / "grid.png"
-            save_prediction_grid(state["model"], state["datasets"]["val"], [0, 1], out, device, use_amp, "sanity",
+            vis_ds = state["datasets"]["val"]
+            vis_indices = list(range(min(2, len(vis_ds))))
+            save_prediction_grid(state["model"], vis_ds, vis_indices, out, device, use_amp, "sanity",
                                  info["thermal_mean"], info["thermal_std"])
             assert out.is_file() and out.stat().st_size > 1000, "prediction grid not written"
             plot_pred_distribution(state["res"]["metrics"], Path(td) / "dist.png", "sanity")
@@ -1156,6 +1309,7 @@ def _run(args, run: RunState) -> int:
                                  device, use_amp, f"Validation predictions - epoch {epoch}", *thermal)
             plot_pred_distribution(m, plots_dir / f"val_pred_distribution_epoch{epoch:03d}.png",
                                    f"Validation, epoch {epoch}: ground-truth vs predicted pixel share")
+            plot_iou_history(history, plots_dir / "val_per_class_iou_heatmap.png")
         sync(device)
         t_end = time.perf_counter()
         total_sec, other_sec = t_end - t_ep, t_end - t_va
@@ -1171,6 +1325,7 @@ def _run(args, run: RunState) -> int:
         collapse = m["pred_share"][0] > 0.98 and m["gt_share"][0] < 0.97
         log("\n".join([
             f"Epoch {epoch:03d}/{args.epochs}" + ("   * new best" if is_best else ""),
+            f"Compute device:   {live_device_status(device)}",
             f"Train time:       {fmt_time(train_sec)}",
             f"Validation time:  {fmt_time(val_sec)}",
             f"Other (ckpt/plots): {fmt_time(other_sec)}",

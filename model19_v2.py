@@ -2,7 +2,8 @@
 model19_v2.py -- RTFNet-inspired ResNet-18 for RGB-Thermal semantic segmentation (V2).
 
 Standalone: depends only on PyTorch + torchvision (never imports the teammate's model.py
-and never imports model19.py).
+and never imports model19.py). This module has no dataset-path assumptions; dataset19_v2.py
+supplies RGB/thermal tensors from either the raw Kaggle RGBA layout or the prepared layout.
 
 What this is (and is not)
 -------------------------

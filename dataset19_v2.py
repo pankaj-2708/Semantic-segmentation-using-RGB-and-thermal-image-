@@ -1,11 +1,16 @@
 """
 dataset19_v2.py -- RGB-Thermal MFNet loader, validation and LABEL DIAGNOSTICS (V2).
 
-Standalone: does not import the teammate's dataset.py or dataset19.py.  Never writes to, or
-re-downloads, the dataset folder.  Default root: ``../MFNet_CMX`` next to the repository.
+Standalone: does not import the teammate's dataset.py or dataset19.py. Never writes to or
+re-downloads the dataset. Supports both common MFNet layouts:
 
-    MFNet_CMX/RGB/<id>.png (3-ch)  Thermal/<id>.png (1-ch)  Label/<id>.png (ids 0..8)
-    MFNet_CMX/train.txt val.txt test.txt
+1) Kaggle/original: ../MFNet_dataset/images/<id>.png (RGBA: RGB + thermal in channel 4),
+   ../MFNet_dataset/labels/<id>.png, train.txt, val.txt, test.txt.
+2) Prepared: ../MFNet_CMX/RGB/<id>.png, Thermal/<id>.png, Label/<id>.png.
+
+Nested archive folders such as images/images and labels/labels are also detected. The default
+searches for ../MFNet_dataset first, then ../MFNet_CMX, so teammates downloading the Kaggle
+version can run the same scripts without converting the data first.
 
 Diagnostic command (run FIRST, it changes nothing):
     python dataset19_v2.py --diagnose
@@ -90,24 +95,98 @@ class DatasetValidationError(RuntimeError):
 # --------------------------------------------------------------------------- #
 # Paths and split files
 # --------------------------------------------------------------------------- #
+def _has_pngs(folder: Path) -> bool:
+    return folder.is_dir() and any(folder.glob("*.png"))
+
+
+def _resolve_flat_or_nested(root: Path, name: str) -> Path:
+    """Resolve name/ or common nested name/name/ layout created by some ZIP extracts."""
+    direct = root / name
+    nested = direct / name
+    if _has_pngs(direct):
+        return direct
+    if _has_pngs(nested):
+        return nested
+    # Keep an existing nested directory as the likely location even if it is empty, so
+    # validation can report the missing files at the actual directory.
+    if nested.is_dir() and direct.is_dir():
+        return nested
+    return direct
+
+
+def _looks_like_dataset_root(root: Path) -> bool:
+    if not root.is_dir():
+        return False
+    prepared = all((root / d).is_dir() for d in ("RGB", "Thermal", "Label"))
+    raw = (root / "images").is_dir() and (root / "labels").is_dir()
+    return prepared or raw
+
+
+def dataset_layout(root: str | Path) -> Dict[str, object]:
+    """Return resolved modality directories and layout kind for prepared or raw MFNet."""
+    root = Path(root).expanduser().resolve()
+    if all((root / d).is_dir() for d in ("RGB", "Thermal", "Label")):
+        return {
+            "kind": "prepared",
+            "rgb_dir": _resolve_flat_or_nested(root, "RGB"),
+            "thermal_dir": _resolve_flat_or_nested(root, "Thermal"),
+            "label_dir": _resolve_flat_or_nested(root, "Label"),
+        }
+    if (root / "images").is_dir() and (root / "labels").is_dir():
+        return {
+            "kind": "kaggle",
+            "rgb_dir": _resolve_flat_or_nested(root, "images"),
+            "thermal_dir": None,  # thermal is stored in RGBA channel 4 of images/<id>.png
+            "label_dir": _resolve_flat_or_nested(root, "labels"),
+        }
+    raise DatasetValidationError(
+        f"Cannot recognize MFNet layout at {root}. Expected either RGB/Thermal/Label or "
+        "images/labels folders with train.txt, val.txt and test.txt."
+    )
+
+
 def default_data_root() -> Path:
+    """Prefer the original Kaggle MFNet_dataset, then the prepared MFNet_CMX layout."""
     here = Path(__file__).resolve().parent
-    cand = here.parent / "MFNet_CMX"
-    if cand.is_dir():
-        return cand
-    alt = Path.cwd().resolve().parent / "MFNet_CMX"
-    return alt if alt.is_dir() else cand
+    cwd = Path.cwd().resolve()
+    bases = [here.parent, here, cwd.parent, cwd]
+    names = ("MFNet_dataset", "MFNet_CMX", "ir_seg_dataset")
+    seen = set()
+    candidates = []
+    for base in bases:
+        for name in names:
+            candidate = (base / name).resolve()
+            if candidate not in seen:
+                seen.add(candidate)
+                candidates.append(candidate)
+                # Some Kaggle ZIPs add one extra root folder.
+                candidates.extend([(candidate / "MFNet_dataset").resolve(), (candidate / "MFNet_CMX").resolve()])
+    for candidate in candidates:
+        if _looks_like_dataset_root(candidate):
+            return candidate
+    # Keep a predictable fallback so the validation message points to the expected path.
+    return (here.parent / "MFNet_dataset").resolve()
 
 
 def resolve_data_root(data_root: Optional[str | Path] = None) -> Path:
-    return Path(data_root).expanduser().resolve() if data_root else default_data_root()
+    if data_root is None:
+        return default_data_root()
+    root = Path(data_root).expanduser().resolve()
+    if _looks_like_dataset_root(root):
+        return root
+    # If a user passes the project parent instead of the dataset root, find a conventional child.
+    for name in ("MFNet_dataset", "MFNet_CMX", "ir_seg_dataset"):
+        candidate = root / name
+        if _looks_like_dataset_root(candidate):
+            return candidate.resolve()
+    return root
 
 
 def read_split_file(root: Path, split: str) -> Tuple[List[str], Dict[str, object]]:
     path = Path(root) / f"{split}.txt"
     if not path.is_file():
         raise DatasetValidationError(f"Split file not found: {path}")
-    names, seen, dups, n = [], set(), [], 0
+    names, seen, dups, n, virtual_flips = [], set(), [], 0, 0
     with open(path, "r", encoding="utf-8-sig") as f:
         for line in f:
             s = line.strip()
@@ -116,13 +195,18 @@ def read_split_file(root: Path, split: str) -> Tuple[List[str], Dict[str, object
             n += 1
             if s.lower().endswith(".png"):
                 s = s[:-4]
+            # MFNet train.txt often represents flipped copies with virtual *_flip entries.
+            # Remove these entries and perform synchronized random flipping in the loader instead.
+            if split == "train" and s.endswith("_flip"):
+                s = s[:-5]
+                virtual_flips += 1
             if s in seen:
                 dups.append(s)
                 continue
             seen.add(s)
             names.append(s)
-    return names, {"path": str(path), "lines": n, "duplicates": dups}
-
+    return names, {"path": str(path), "lines": n, "duplicates": dups,
+                   "virtual_flips_normalized": virtual_flips}
 
 def unique_path(path: Path) -> Path:
     """Never overwrite an existing output: append a timestamp instead."""
@@ -156,11 +240,38 @@ def label_histogram(path: Path) -> np.ndarray:
     return np.bincount(read_label_array(path).ravel(), minlength=256).astype(np.int64)[:256]
 
 
+def label_path(root: Path, name: str) -> Path:
+    return Path(dataset_layout(root)["label_dir"]) / f"{name}.png"
+
+
+def image_path(root: Path, name: str) -> Path:
+    return Path(dataset_layout(root)["rgb_dir"]) / f"{name}.png"
+
+
+def thermal_array_for_sample(root: Path, name: str) -> np.ndarray:
+    """Read thermal pixels from a separate Thermal PNG or the 4th channel of raw RGBA MFNet."""
+    layout = dataset_layout(root)
+    if layout["kind"] == "prepared":
+        return read_thermal_array(Path(layout["thermal_dir"]) / f"{name}.png")
+    path = Path(layout["rgb_dir"]) / f"{name}.png"
+    with Image.open(path) as im:
+        arr = np.asarray(im)
+    if arr.ndim != 3 or arr.shape[2] != 4:
+        raise DatasetValidationError(
+            f"Raw Kaggle image {path} has shape {arr.shape}; expected RGBA where channel 4 stores thermal data. "
+            "If your download has separate thermal files, use a prepared RGB/Thermal/Label layout."
+        )
+    thermal = arr[..., 3]
+    if thermal.dtype == np.uint16:
+        return thermal.astype(np.float32) / 257.0
+    return thermal.astype(np.float32)
+
+
 def compute_label_counts(root: Path, names: Sequence[str]) -> np.ndarray:
     """Total pixel count per label id (int64[256]) over the given sample names."""
     hist = np.zeros(256, dtype=np.int64)
     for n in names:
-        hist += label_histogram(Path(root) / "Label" / f"{n}.png")
+        hist += label_histogram(label_path(root, n))
     return hist
 
 
@@ -169,8 +280,10 @@ def compute_thermal_stats(root: Path, names: Sequence[str]) -> Tuple[float, floa
     s = s2 = 0.0
     n = 0
     for name in names:
-        a = read_thermal_array(Path(root) / "Thermal" / f"{name}.png").astype(np.float64) / 255.0
+        a = thermal_array_for_sample(root, name).astype(np.float64) / 255.0
         s += a.sum(); s2 += (a ** 2).sum(); n += a.size
+    if n == 0:
+        raise DatasetValidationError("Cannot calculate thermal statistics: no training pixels found")
     mean = s / n
     return float(mean), float(np.sqrt(max(s2 / n - mean ** 2, 0.0)))
 
@@ -204,6 +317,7 @@ def thermal_stats_for_train(root: Path, cache_path: Optional[Path] = None,
 @dataclass
 class ValidationReport:
     root: Path
+    source_layout: str = ""
     counts: Dict[str, int] = field(default_factory=dict)
     errors: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
@@ -225,6 +339,8 @@ class ValidationReport:
     def print_summary(self) -> None:
         print("=" * 72)
         print(f"Dataset root : {self.root}")
+        if self.source_layout:
+            print(f"Source layout: {self.source_layout}")
         for d, n in self.folder_counts.items():
             print(f"  {d + '/':<9} {n} PNG files")
         for s in SPLITS:
@@ -254,9 +370,8 @@ def _stems(folder: Path) -> set:
 
 def validate_dataset(root: str | Path, splits: Sequence[str] = SPLITS, scan_labels: bool = True,
                      deep: bool = False, verbose: bool = True) -> ValidationReport:
-    """Folders, split membership, pairing, sizes, label ids.  scan_labels decodes every mask;
-    deep also decodes every RGB/thermal PNG."""
-    root = Path(root)
+    """Validate either raw Kaggle MFNet (RGBA images + labels) or prepared RGB/Thermal/Label data."""
+    root = Path(root).expanduser().resolve()
     rep = ValidationReport(root=root)
 
     def finish():
@@ -267,39 +382,64 @@ def validate_dataset(root: str | Path, splits: Sequence[str] = SPLITS, scan_labe
     if not root.is_dir():
         rep.errors.append(f"data root does not exist: {root}")
         return finish()
-    dirs = {"RGB": root / "RGB", "Thermal": root / "Thermal", "Label": root / "Label"}
-    stems = {}
-    for key, d in dirs.items():
-        if not d.is_dir():
-            rep.errors.append(f"missing folder: {d}")
-        stems[key] = _stems(d)
-        rep.folder_counts[key] = len(stems[key])
-    if rep.errors:
+    try:
+        layout = dataset_layout(root)
+    except DatasetValidationError as exc:
+        rep.errors.append(str(exc))
         return finish()
-    for a, b in (("RGB", "Thermal"), ("RGB", "Label")):
-        oa, ob = sorted(stems[a] - stems[b]), sorted(stems[b] - stems[a])
-        if oa:
-            rep.errors.append(f"{len(oa)} files in {a}/ without a {b}/ partner, e.g. {oa[:3]}")
-        if ob:
-            rep.errors.append(f"{len(ob)} files in {b}/ without a {a}/ partner, e.g. {ob[:3]}")
 
+    raw_layout = layout["kind"] == "kaggle"
+    if raw_layout:
+        rep.source_layout = "Kaggle/original MFNet (images/*.png RGBA: RGB + thermal channel 4; labels/*.png)"
+        dirs = {"RGB": Path(layout["rgb_dir"]), "Label": Path(layout["label_dir"])}
+        image_stems = _stems(dirs["RGB"])
+        label_stems = _stems(dirs["Label"])
+        stems = {"RGB": image_stems, "Thermal": image_stems, "Label": label_stems}
+        rep.folder_counts = {"images (RGB+thermal)": len(image_stems), "labels": len(label_stems)}
+        no_img = sorted(label_stems - image_stems)
+        if no_img:
+            rep.errors.append(f"{len(no_img)} labels have no matching source image, e.g. {no_img[:5]}")
+        unlabeled_imgs = sorted(image_stems - label_stems)
+        if unlabeled_imgs:
+            rep.warnings.append(f"{len(unlabeled_imgs)} images have no label and will not be used as supervised samples; e.g. {unlabeled_imgs[:5]}")
+    else:
+        rep.source_layout = "Prepared MFNet (RGB/*.png + Thermal/*.png + Label/*.png)"
+        dirs = {"RGB": Path(layout["rgb_dir"]), "Thermal": Path(layout["thermal_dir"]),
+                "Label": Path(layout["label_dir"])}
+        stems = {key: _stems(value) for key, value in dirs.items()}
+        rep.folder_counts = {key: len(value) for key, value in stems.items()}
+        for key, folder in dirs.items():
+            if not folder.is_dir():
+                rep.errors.append(f"missing folder: {folder}")
+            if not stems[key]:
+                rep.errors.append(f"no PNG files found in {key} directory: {folder}")
+        for a, b in (("RGB", "Thermal"), ("RGB", "Label"), ("Thermal", "Label")):
+            oa, ob = sorted(stems[a] - stems[b]), sorted(stems[b] - stems[a])
+            if oa:
+                rep.errors.append(f"{len(oa)} files in {a}/ without a {b}/ partner, e.g. {oa[:3]}")
+            if ob:
+                rep.errors.append(f"{len(ob)} files in {b}/ without an {a}/ partner, e.g. {ob[:3]}")
+
+    # All train/val/test split names must have all required data. The raw Kaggle thermal
+    # channel comes from the same RGBA image as RGB and thus uses the same stem set.
     split_names: Dict[str, List[str]] = {}
-    for s in splits:
+    for split in splits:
         try:
-            names, info = read_split_file(root, s)
+            names, info = read_split_file(root, split)
         except DatasetValidationError as exc:
             rep.errors.append(str(exc))
             continue
-        split_names[s] = names
-        rep.counts[s] = len(names)
+        split_names[split] = names
+        rep.counts[split] = len(names)
         if info["duplicates"]:
-            rep.warnings.append(f"{s}.txt had {len(info['duplicates'])} duplicate entries (de-duplicated)")
+            rep.warnings.append(f"{split}.txt had {len(info['duplicates'])} duplicate/virtual-flip entries; normalized to {len(names)} unique ids")
         if not names:
-            rep.errors.append(f"{s}.txt is empty")
-        for key in dirs:
-            missing = [n for n in names if n not in stems[key]]
+            rep.errors.append(f"{split}.txt is empty")
+        for key in ("RGB", "Thermal", "Label"):
+            missing = [name for name in names if name not in stems[key]]
             if missing:
-                rep.errors.append(f"{s}: {len(missing)} entries have no {key}/ file, e.g. {missing[:3]}")
+                rep.errors.append(f"{split}: {len(missing)} entries have no {key} data, e.g. {missing[:3]}")
+
     done = list(split_names)
     for i in range(len(done)):
         for j in range(i + 1, len(done)):
@@ -309,38 +449,60 @@ def validate_dataset(root: str | Path, splits: Sequence[str] = SPLITS, scan_labe
     if rep.errors:
         return finish()
 
-    for s, names in split_names.items():
+    for split, names in split_names.items():
         hist = np.zeros(256, dtype=np.int64)
-        for n in names:
+        for name in names:
             try:
-                with Image.open(dirs["RGB"] / f"{n}.png") as im:
-                    sz_rgb = im.size
-                with Image.open(dirs["Thermal"] / f"{n}.png") as im:
-                    sz_th = im.size
-                with Image.open(dirs["Label"] / f"{n}.png") as im:
+                rgb_path = dirs["RGB"] / f"{name}.png"
+                label_file = dirs["Label"] / f"{name}.png"
+                with Image.open(rgb_path) as im:
+                    sz_rgb, img_mode = im.size, im.mode
+                    if raw_layout:
+                        if img_mode != "RGBA":
+                            arr = np.asarray(im)
+                            if arr.ndim != 3 or arr.shape[2] != 4:
+                                rep.errors.append(f"{split}/{name}: raw image mode {img_mode!r} has no 4th thermal channel")
+                        elif deep:
+                            arr = np.asarray(im)
+                            if arr.ndim != 3 or arr.shape[2] != 4:
+                                rep.errors.append(f"{split}/{name}: expected RGBA image with 4 channels, got {arr.shape}")
+                if raw_layout:
+                    sz_th = sz_rgb
+                else:
+                    with Image.open(dirs["Thermal"] / f"{name}.png") as im:
+                        sz_th = im.size
+                with Image.open(label_file) as im:
                     sz_lab, mode = im.size, im.mode
             except Exception as exc:  # noqa: BLE001
-                rep.errors.append(f"{s}/{n}: cannot open image ({type(exc).__name__}: {exc})")
+                rep.errors.append(f"{split}/{name}: cannot open image ({type(exc).__name__}: {exc})")
                 continue
             rep.image_sizes[sz_rgb] += 1
             if not (sz_rgb == sz_th == sz_lab):
-                rep.errors.append(f"{s}/{n}: size mismatch RGB{sz_rgb} Thermal{sz_th} Label{sz_lab}")
+                rep.errors.append(f"{split}/{name}: size mismatch RGB{sz_rgb} Thermal{sz_th} Label{sz_lab}")
             if mode not in ("L", "P", "I;16", "I"):
-                rep.errors.append(f"{s}/{n}: label mode {mode!r} (expected single-channel L/P)")
+                rep.errors.append(f"{split}/{name}: label mode {mode!r} (expected single-channel L/P)")
                 continue
             if deep:
                 try:
-                    np.asarray(Image.open(dirs["RGB"] / f"{n}.png").convert("RGB"))
-                    np.asarray(Image.open(dirs["Thermal"] / f"{n}.png"))
+                    if raw_layout:
+                        with Image.open(rgb_path) as im:
+                            arr = np.asarray(im)
+                        if arr.ndim != 3 or arr.shape[2] != 4:
+                            rep.errors.append(f"{split}/{name}: expected raw RGBA RGB+thermal file, got {arr.shape}")
+                    else:
+                        with Image.open(dirs["RGB"] / f"{name}.png") as im:
+                            np.asarray(im.convert("RGB"))
+                        with Image.open(dirs["Thermal"] / f"{name}.png") as im:
+                            np.asarray(im)
                 except Exception as exc:  # noqa: BLE001
-                    rep.errors.append(f"{s}/{n}: corrupt RGB/thermal ({type(exc).__name__}: {exc})")
+                    rep.errors.append(f"{split}/{name}: corrupt image ({type(exc).__name__}: {exc})")
             if scan_labels:
                 try:
-                    hist += label_histogram(dirs["Label"] / f"{n}.png")
+                    hist += label_histogram(label_file)
                 except Exception as exc:  # noqa: BLE001
-                    rep.errors.append(f"{s}/{n}: cannot decode label ({type(exc).__name__}: {exc})")
+                    rep.errors.append(f"{split}/{name}: cannot decode label ({type(exc).__name__}: {exc})")
         if scan_labels:
-            rep.label_pixels[s] = hist
+            rep.label_pixels[split] = hist
     if len(rep.image_sizes) > 1:
         rep.warnings.append(f"more than one image size present: {dict(rep.image_sizes)}")
     if scan_labels and rep.label_pixels:
@@ -349,15 +511,13 @@ def validate_dataset(root: str | Path, splits: Sequence[str] = SPLITS, scan_labe
             if cid != IGNORE_INDEX and total[cid] > 0:
                 rep.unexpected_label_ids[cid] = int(total[cid])
         if rep.unexpected_label_ids:
-            rep.errors.append(f"unexpected label ids (not 0..{NUM_CLASSES - 1} or {IGNORE_INDEX}): "
-                              f"{rep.unexpected_label_ids}")
+            rep.errors.append(f"unexpected label ids (not 0..{NUM_CLASSES - 1} or {IGNORE_INDEX}): {rep.unexpected_label_ids}")
         if total[IGNORE_INDEX] > 0:
-            rep.warnings.append(f"label id {IGNORE_INDEX} present in {int(total[IGNORE_INDEX])} pixels "
-                                "(treated as ignore_index)")
-    for s in splits:
-        exp = EXPECTED_COUNTS.get(s)
-        if s in rep.counts and exp is not None and rep.counts[s] != exp:
-            rep.warnings.append(f"{s} has {rep.counts[s]} samples; the project notes say {exp}")
+            rep.warnings.append(f"label id {IGNORE_INDEX} present in {int(total[IGNORE_INDEX])} pixels (treated as ignore_index)")
+    for split in splits:
+        exp = EXPECTED_COUNTS.get(split)
+        if split in rep.counts and exp is not None and rep.counts[split] != exp:
+            rep.warnings.append(f"{split} has {rep.counts[split]} samples; expected {exp} after virtual-flip normalization")
     return finish()
 
 
@@ -413,7 +573,8 @@ class RGBTDataset(Dataset):
             raise ValueError("crop_rate must be in [0, 0.5)")
         if thermal_std <= 0:
             raise ValueError("thermal_std must be > 0")
-        self.root, self.split, self.img_size = Path(data_root), split, (h, w)
+        self.root, self.split, self.img_size = Path(data_root).expanduser().resolve(), split, (h, w)
+        self.layout = dataset_layout(self.root)
         self.augment, self.flip_prob = bool(augment), float(flip_prob)
         self.crop_rate, self.crop_prob = float(crop_rate), float(crop_prob)
         self.thermal_mean, self.thermal_std = float(thermal_mean), float(thermal_std)
@@ -429,9 +590,22 @@ class RGBTDataset(Dataset):
 
     def load_raw(self, name: str):
         try:
-            rgb = Image.open(self.root / "RGB" / f"{name}.png").convert("RGB")
-            th = Image.fromarray(read_thermal_array(self.root / "Thermal" / f"{name}.png"))
-            lab = Image.fromarray(read_label_array(self.root / "Label" / f"{name}.png"))
+            rgb_file = Path(self.layout["rgb_dir"]) / f"{name}.png"
+            label_file = Path(self.layout["label_dir"]) / f"{name}.png"
+            if self.layout["kind"] == "prepared":
+                with Image.open(rgb_file) as im:
+                    rgb = im.convert("RGB")
+                thermal_arr = read_thermal_array(Path(self.layout["thermal_dir"]) / f"{name}.png")
+                th = Image.fromarray(thermal_arr)
+            else:
+                # Original Kaggle MFNet stores RGB and thermal together in the RGBA PNG.
+                with Image.open(rgb_file) as im:
+                    raw = np.asarray(im)
+                if raw.ndim != 3 or raw.shape[2] != 4:
+                    raise ValueError(f"expected raw RGBA RGB+thermal image, got shape {raw.shape} mode from {rgb_file}")
+                rgb = Image.fromarray(raw[..., :3].astype(np.uint8))
+                th = Image.fromarray(raw[..., 3].astype(np.uint8))
+            lab = Image.fromarray(read_label_array(label_file))
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"failed to load sample {name!r} from {self.root}: {exc}") from exc
         if not (rgb.size == th.size == lab.size):
@@ -596,7 +770,7 @@ def diagnose(root: Path, out_dir: Path, print_masks: int = 5, preview_n: int = 4
             w.writerow(["sample"] + [f"class{i}_px" for i in range(NUM_CLASSES)] + ["other_ids_px", "unique_ids"])
             shown = 0
             for n in names:
-                h = label_histogram(root / "Label" / f"{n}.png")
+                h = label_histogram(label_path(root, n))
                 total += h
                 ids = [i for i in range(256) if h[i] > 0]
                 for i in ids:
@@ -680,7 +854,7 @@ def diagnose(root: Path, out_dir: Path, print_masks: int = 5, preview_n: int = 4
             # pick evenly spaced samples, but prefer ones that contain many different classes
             cand = np.unique(np.linspace(0, len(names) - 1, num=min(40, len(names))).round().astype(int))
             def n_cls(i):
-                return int((label_histogram(root / "Label" / f"{names[i]}.png")[1:NUM_CLASSES] > 0).sum())
+                return int((label_histogram(label_path(root, names[i]))[1:NUM_CLASSES] > 0).sum())
             ranked = sorted(cand, key=lambda i: -n_cls(i))[:preview_n]
             fig, axes = plt.subplots(len(ranked), 4, figsize=(16, 3.6 * len(ranked) + 1.0), squeeze=False)
             for r, i in enumerate(ranked):
@@ -704,7 +878,7 @@ def diagnose(root: Path, out_dir: Path, print_masks: int = 5, preview_n: int = 4
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Validate / diagnose the prepared RGB-T dataset (read-only)")
-    p.add_argument("--data-root", default=None, help="default: ../MFNet_CMX next to this file")
+    p.add_argument("--data-root", default=None, help="default: auto-detect ../MFNet_dataset (Kaggle raw) first, then ../MFNet_CMX (prepared)")
     p.add_argument("--img-size", type=int, nargs=2, metavar=("H", "W"), default=list(NATIVE_HW))
     p.add_argument("--diagnose", action="store_true", help="full label / alignment diagnostic + preview plots")
     p.add_argument("--out-dir", default=None, help="default: plots/model19_v2/diagnostics next to this file")
