@@ -8,7 +8,7 @@ Features:
 - Combined Cross-Entropy + Dice loss respecting IGNORE_INDEX
 - Comprehensive checkpointing (per-epoch, last, best)
 - Automated training-curve plots
-- Auto-download of MFNet dataset via gdown if not present
+- Auto-download of MFNet dataset via Kaggle if not present
 """
 
 import os
@@ -58,8 +58,8 @@ TQDM_SMOOTHING    = 0.1
 NUM_CLASSES   = 9          # MFNet: 0=Unlabeled, 1-8 objects
 IN_CHANNELS   = 4          # RGB (3) + Thermal (1)
 IGNORE_INDEX  = 255
-BATCH_SIZE    = 4
-EPOCHS        = 20
+BATCH_SIZE    = 24
+EPOCHS        = 50
 LEARNING_RATE = 1e-3
 WEIGHT_DECAY  = 1e-4
 ARCH          = "mfnet"
@@ -653,7 +653,7 @@ def train(
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(plot_dir, exist_ok=True)
 
-    print(f"\nStarting training: epochs {start_epoch}→{epochs} | device={device}")
+    print(f"\nStarting training: epochs {start_epoch}->{epochs} | device={device}")
     print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}\n")
 
     for epoch in range(start_epoch, epochs + 1):

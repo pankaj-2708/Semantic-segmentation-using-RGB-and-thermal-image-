@@ -3,4 +3,4 @@ tqdm
 uv
 matplotlib
 numpy
-gdown
+kaggle

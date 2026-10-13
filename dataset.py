@@ -21,9 +21,9 @@ MFNet class map (9 classes):
   8: Bump
 
 Download:
-  The dataset is automatically downloaded from Google Drive on first run if the
+  The dataset is automatically downloaded from Kaggle on first run if the
   data_root folder does not exist or is missing the expected subfolders.
-  Google Drive folder ID: 18BQFWRfhXzSuMloUmtiBRFrr6NSrf8Fw
+  Kaggle dataset: danialqashqai/mfnet-dataset
 """
 
 import os
@@ -63,72 +63,67 @@ CLASS_NAMES = [
     "Curve", "Car Stop", "Guardrail", "Color Cone", "Bump",
 ]
 
-# Google Drive folder ID for the MFNet dataset
-GDRIVE_FOLDER_ID = "18BQFWRfhXzSuMloUmtiBRFrr6NSrf8Fw"
+# Kaggle dataset ID for MFNet
+KAGGLE_DATASET_ID = "danialqashqai/mfnet-dataset"
 
 
 # ==========================================
 # Download Helper
 # ==========================================
 
-def _try_download_dataset(data_root: str) -> bool:
+def _try_kaggle_download(data_root: str) -> bool:
     """
-    Attempts to download the MFNet dataset from Google Drive using gdown.
-    Returns True if download succeeded, False otherwise.
+    Downloads and extracts the MFNet dataset from Kaggle into data_root.
+    Kaggle dataset: danialqashqai/mfnet-dataset
     """
     try:
-        import gdown
+        import kaggle
     except ImportError:
-        print("[dataset.py] gdown not installed. Run: pip install gdown")
-        return False
-
-    print(f"[dataset.py] Attempting to download MFNet dataset to '{data_root}'...")
-    print(f"[dataset.py] Google Drive Folder ID: {GDRIVE_FOLDER_ID}")
+        print("[dataset.py] Installing kaggle package...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "kaggle", "-q"])
+        except Exception as e:
+            print(f"[dataset.py] Failed to install kaggle: {e}")
+            return False
 
     os.makedirs(data_root, exist_ok=True)
-    url = f"https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}"
+    print(f"[dataset.py] Downloading MFNet dataset from Kaggle ('{KAGGLE_DATASET_ID}') to '{data_root}'...")
 
     try:
-        result = gdown.download_folder(
-            url,
-            output=data_root,
-            quiet=False,
-            use_cookies=False,
-            remaining_ok=True,   # Allow folders with >50 files
-        )
-        if result:
-            print(f"[dataset.py] Download completed: {result}")
-            return True
-        else:
-            print("[dataset.py] gdown returned no result (may have failed silently).")
-            return False
-    except Exception as e:
-        print(f"[dataset.py] gdown download failed: {e}")
-        return False
-
-
-def _try_kaggle_download(data_root: str) -> bool:
-    """Try downloading MFNet dataset via kaggle CLI."""
-    try:
-        os.makedirs(data_root, exist_ok=True)
-        print(f"[dataset.py] Attempting Kaggle dataset download into '{data_root}'...")
-        cmd = ["kaggle", "datasets", "download", "-d", "danialqashqai/mfnet-dataset", "--unzip", "-p", data_root]
+        cmd = [
+            sys.executable, "-m", "kaggle", "datasets", "download",
+            "-d", KAGGLE_DATASET_ID,
+            "--unzip",
+            "-p", data_root,
+        ]
         res = subprocess.run(cmd, capture_output=True, text=True)
-        # Check if extracted into a nested directory
-        nested = os.path.join(data_root, "MFNet-dataset", "ir_seg_dataset")
-        if os.path.isdir(nested):
-            for item in os.listdir(nested):
-                s = os.path.join(nested, item)
-                d = os.path.join(data_root, item)
-                if not os.path.exists(d):
-                    shutil.move(s, d)
-            try:
-                shutil.rmtree(os.path.join(data_root, "MFNet-dataset"))
-            except Exception:
-                pass
-        return res.returncode == 0
+        if res.returncode != 0:
+            print(f"[dataset.py] Kaggle download failed (code {res.returncode}):\n{res.stderr or res.stdout}")
+            return False
+
+        # Flatten nested directories if present (e.g., MFNet-dataset/ir_seg_dataset)
+        nested_candidates = [
+            os.path.join(data_root, "MFNet-dataset", "ir_seg_dataset"),
+            os.path.join(data_root, "MFNet-dataset"),
+            os.path.join(data_root, "ir_seg_dataset"),
+        ]
+        for nested in nested_candidates:
+            if os.path.isdir(nested) and _dataset_is_ready(nested):
+                for item in os.listdir(nested):
+                    s = os.path.join(nested, item)
+                    d = os.path.join(data_root, item)
+                    if not os.path.exists(d):
+                        shutil.move(s, d)
+                try:
+                    shutil.rmtree(os.path.join(data_root, "MFNet-dataset"))
+                except Exception:
+                    pass
+                break
+
+        print("[dataset.py] Kaggle dataset download and extraction completed.")
+        return True
     except Exception as e:
-        print(f"[dataset.py] Kaggle download failed: {e}")
+        print(f"[dataset.py] Kaggle download exception: {e}")
         return False
 
 
@@ -154,28 +149,22 @@ def _dataset_is_ready(data_root: str) -> bool:
 def ensure_dataset(data_root: str) -> bool:
     """
     Ensures the MFNet dataset is present at data_root.
-    Downloads it if missing. Returns True if dataset is ready.
+    Downloads it from Kaggle if missing. Returns True if dataset is ready.
     """
     if _dataset_is_ready(data_root):
         print(f"[dataset.py] Dataset found at '{data_root}'.")
         return True
 
-    print(f"[dataset.py] Dataset not found or incomplete at '{data_root}'. Attempting download...")
-    ok = _try_download_dataset(data_root)
-
-    if not ok or not _dataset_is_ready(data_root):
-        print("[dataset.py] Google Drive download did not complete. Trying Kaggle mirror...")
-        ok = _try_kaggle_download(data_root)
+    print(f"[dataset.py] Dataset not found or incomplete at '{data_root}'. Attempting download from Kaggle...")
+    _try_kaggle_download(data_root)
 
     if _dataset_is_ready(data_root):
         print(f"[dataset.py] Dataset ready at '{data_root}'.")
         return True
 
     print(
-        "[dataset.py] ERROR: Could not download or verify MFNet dataset.\n"
-        "  Manual download options:\n"
-        f"    1. Google Drive: https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}\n"
-        "    2. Kaggle dataset: danialqashqai/mfnet-dataset\n"
+        "[dataset.py] ERROR: Could not download or verify MFNet dataset from Kaggle.\n"
+        f"  Kaggle dataset: {KAGGLE_DATASET_ID}\n"
         "  Expected layout:\n"
         f"    {data_root}/images/  (4-channel PNG files)\n"
         f"    {data_root}/labels/  (greyscale mask PNG files)\n"

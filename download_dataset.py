@@ -1,8 +1,8 @@
 """
-download_dataset.py - Helper script to download the MFNet RGB+Thermal dataset.
+download_dataset.py - Helper script to download the MFNet RGB+Thermal dataset from Kaggle.
 
 Usage:
-    python download_dataset.py [--output-dir MFNet_dataset]
+    python download_dataset.py [--output-dir ../MFNet_dataset]
 
 The MFNet dataset contains:
   - 1569 images (820 daytime, 749 nighttime)
@@ -10,46 +10,66 @@ The MFNet dataset contains:
   - Single-channel label masks (0-8 class IDs)
   - train.txt / val.txt / test.txt split files
 
-Google Drive Folder: https://drive.google.com/drive/folders/18BQFWRfhXzSuMloUmtiBRFrr6NSrf8Fw
+Kaggle Dataset: danialqashqai/mfnet-dataset
 """
 
 import os
 import sys
+import shutil
 import argparse
 import subprocess
 
 
-GDRIVE_FOLDER_ID = "18BQFWRfhXzSuMloUmtiBRFrr6NSrf8Fw"
+KAGGLE_DATASET_ID = "danialqashqai/mfnet-dataset"
 
 
-def try_gdown(output_dir: str) -> bool:
-    """Try downloading via gdown."""
+def try_kaggle(output_dir: str) -> bool:
+    """Download MFNet dataset via kaggle CLI."""
     try:
-        import gdown
+        import kaggle
     except ImportError:
-        print("[downloader] Installing gdown...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "gdown", "-q"])
-        import gdown
+        print("[downloader] Installing kaggle package...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "kaggle", "-q"])
 
-    url = f"https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}"
-    print(f"[downloader] Attempting gdown download from: {url}")
+    print(f"[downloader] Attempting Kaggle download from: {KAGGLE_DATASET_ID}")
     print(f"[downloader] Output directory: {output_dir}")
 
     os.makedirs(output_dir, exist_ok=True)
     try:
-        result = gdown.download_folder(
-            url,
-            output=output_dir,
-            quiet=False,
-            use_cookies=False,
-            # remaining_ok=True,
-        )
-        if result:
-            print(f"[downloader] gdown succeeded: {result}")
-            return True
-        return False
+        cmd = [
+            sys.executable, "-m", "kaggle", "datasets", "download",
+            "-d", KAGGLE_DATASET_ID,
+            "--unzip",
+            "-p", output_dir,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            print(f"[downloader] Kaggle download failed: {res.stderr or res.stdout}")
+            return False
+
+        # Flatten nested directory structure if needed
+        nested_candidates = [
+            os.path.join(output_dir, "MFNet-dataset", "ir_seg_dataset"),
+            os.path.join(output_dir, "MFNet-dataset"),
+            os.path.join(output_dir, "ir_seg_dataset"),
+        ]
+        for nested in nested_candidates:
+            if os.path.isdir(nested) and check_dataset(nested):
+                for item in os.listdir(nested):
+                    s = os.path.join(nested, item)
+                    d = os.path.join(output_dir, item)
+                    if not os.path.exists(d):
+                        shutil.move(s, d)
+                try:
+                    shutil.rmtree(os.path.join(output_dir, "MFNet-dataset"))
+                except Exception:
+                    pass
+                break
+
+        print("[downloader] Kaggle download and extraction succeeded!")
+        return True
     except Exception as e:
-        print(f"[downloader] gdown failed: {e}")
+        print(f"[downloader] Kaggle download error: {e}")
         return False
 
 
@@ -66,7 +86,7 @@ def check_dataset(output_dir: str) -> bool:
     }
 
     for name, ok in checks.items():
-        status = "✓" if ok else "✗"
+        status = "[OK]" if ok else "[X]"
         print(f"  {status} {name}")
 
     if all(checks.values()):
@@ -81,29 +101,23 @@ def print_manual_instructions(output_dir: str):
     print("\n" + "=" * 70)
     print("MANUAL DOWNLOAD INSTRUCTIONS")
     print("=" * 70)
-    print("The automated download failed (old-style Google Drive file IDs")
-    print("require authentication that gdown cannot provide without cookies).")
+    print("The automated download failed.")
     print()
     print("Please download manually:")
-    print(f"  1. Open: https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}")
-    print("  2. Download all files (use 'Download all' or select each folder)")
+    print(f"  1. Kaggle CLI: kaggle datasets download -d {KAGGLE_DATASET_ID} --unzip -p {output_dir}")
+    print(f"  2. Or download from: https://www.kaggle.com/datasets/{KAGGLE_DATASET_ID}")
     print("  3. The dataset should have this structure:")
     print(f"     {output_dir}/")
-    print(f"     {output_dir}/images/   ← 4-channel PNG files (RGB+Thermal)")
-    print(f"     {output_dir}/labels/   ← Single-channel mask PNG files")
+    print(f"     {output_dir}/images/   <- 4-channel PNG files (RGB+Thermal)")
+    print(f"     {output_dir}/labels/   <- Single-channel mask PNG files")
     print(f"     {output_dir}/train.txt")
     print(f"     {output_dir}/val.txt")
     print(f"     {output_dir}/test.txt")
-    print()
-    print("Alternative: The RTFNet preprocessed version is also compatible:")
-    print("  http://gofile.me/4jm56/CfukComo1  (may need gofile.me account)")
-    print()
-    print("For now, training will use SYNTHETIC data as a fallback.")
     print("=" * 70)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Download MFNet Dataset")
+    parser = argparse.ArgumentParser(description="Download MFNet Dataset from Kaggle")
     parser.add_argument(
         "--output-dir", type=str, default="../MFNet_dataset",
         help="Directory to save the dataset"
@@ -118,8 +132,8 @@ def main():
         print("\n[downloader] Dataset already present and complete!")
         return
 
-    # Try gdown
-    ok = try_gdown(output_dir)
+    # Download from Kaggle
+    ok = try_kaggle(output_dir)
 
     print("\n[downloader] Verifying dataset after download...")
     if check_dataset(output_dir):
