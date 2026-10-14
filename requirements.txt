@@ -4,3 +4,4 @@ uv
 matplotlib
 numpy
 kaggle
+albumentations

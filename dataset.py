@@ -268,7 +268,9 @@ class MFNetDataset(Dataset):
                 self._transform = A.Compose([
                     A.Resize(self.img_size[0], self.img_size[1]),
                     A.HorizontalFlip(p=0.5),
-                    A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.3),
+                    A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15, p=0.4),
+                    A.Affine(scale=(0.95, 1.05), translate_percent=(-0.04, 0.04), rotate=(-8, 8), border_mode=0, p=0.4),
+                    A.GaussianBlur(blur_limit=(3, 5), p=0.2),
                     ToTensorV2(),
                 ])
             else:

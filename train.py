@@ -55,15 +55,20 @@ except ImportError as e:
 LOG_EVERY_N_STEPS = 1
 TQDM_SMOOTHING    = 0.1
 
-NUM_CLASSES   = 9          # MFNet: 0=Unlabeled, 1-8 objects
-IN_CHANNELS   = 4          # RGB (3) + Thermal (1)
-IGNORE_INDEX  = 255
-BATCH_SIZE    = 24
-EPOCHS        = 50
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY  = 1e-4
-ARCH          = "mfnet"
-DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
+NUM_CLASSES              = 9          # MFNet: 0=Unlabeled, 1-8 objects
+IN_CHANNELS              = 4          # RGB (3) + Thermal (1)
+IGNORE_INDEX             = 255
+BATCH_SIZE               = 24
+EPOCHS                   = 50
+LEARNING_RATE            = 1e-3
+WEIGHT_DECAY             = 1e-2       # Increased weight decay (L2 regularization) to prevent overfitting
+LABEL_SMOOTHING          = 0.1        # Label smoothing factor to prevent overconfident predictions
+EARLY_STOPPING_PATIENCE  = 10         # Early stopping patience (epochs without validation improvement)
+EARLY_STOPPING_MIN_DELTA = 1e-4       # Minimum delta threshold to count as metric improvement
+DROPOUT_RATE             = 0.2        # Spatial Dropout rate to prevent co-adaptation & overfitting
+GRAD_CLIP_NORM           = 10.0       # Max gradient norm clipping for training stability
+ARCH                     = "mfnet"
+DEVICE                   = "cuda" if torch.cuda.is_available() else "cpu"
 
 CHECKPOINT_DIR    = "checkpoints"
 PLOT_DIR          = "plots"
@@ -309,7 +314,7 @@ def get_class_weights(
 
 
 class CombinedLoss(nn.Module):
-    """Combined Weighted Cross-Entropy + Dice Loss."""
+    """Combined Weighted Cross-Entropy + Dice Loss with Label Smoothing."""
 
     def __init__(
         self,
@@ -318,18 +323,90 @@ class CombinedLoss(nn.Module):
         class_weights: Optional[torch.Tensor] = None,
         ce_weight: float = 1.0,
         dice_weight: float = 1.0,
+        label_smoothing: float = LABEL_SMOOTHING,
     ):
         super().__init__()
         ce_ign = ignore_index if ignore_index is not None else -100
-        self.ce          = nn.CrossEntropyLoss(weight=class_weights, ignore_index=ce_ign)
+        self.ce          = nn.CrossEntropyLoss(
+            weight=class_weights,
+            ignore_index=ce_ign,
+            label_smoothing=label_smoothing,
+        )
         self.dice        = MulticlassDiceLoss(num_classes=num_classes, ignore_index=ignore_index)
         self.ce_weight   = ce_weight
         self.dice_weight = dice_weight
         self.class_weights = class_weights
+        self.label_smoothing = label_smoothing
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         return self.ce_weight * self.ce(logits, targets) + \
                self.dice_weight * self.dice(logits, targets)
+
+
+# ==============================================================================
+# Early Stopping
+# ==============================================================================
+class EarlyStopping:
+    """
+    Early stopping monitor that halts training when the monitored validation metric
+    stops improving after `patience` consecutive epochs.
+
+    Args:
+        patience: Number of epochs to wait without improvement before stopping.
+        min_delta: Minimum metric change to qualify as an improvement.
+        mode: 'max' for metrics where higher is better (mIoU, accuracy),
+              'min' for metrics where lower is better (loss).
+        verbose: If True, prints messages when metric fails to improve or triggers.
+    """
+
+    def __init__(
+        self,
+        patience: int = EARLY_STOPPING_PATIENCE,
+        min_delta: float = EARLY_STOPPING_MIN_DELTA,
+        mode: str = "max",
+        verbose: bool = True,
+    ):
+        self.patience   = patience
+        self.min_delta  = min_delta
+        self.mode       = mode
+        self.verbose    = verbose
+        self.counter    = 0
+        self.best_score = -float("inf") if mode == "max" else float("inf")
+        self.early_stop = False
+        self.best_epoch = -1
+
+    def step(self, current_val: float, epoch: int) -> bool:
+        """
+        Evaluate current metric value and update early stopping counter.
+        Returns True if improved, False otherwise.
+        """
+        if self.patience <= 0:
+            return False  # Early stopping disabled
+
+        if self.mode == "max":
+            improved = (current_val - self.best_score) > self.min_delta
+        else:
+            improved = (self.best_score - current_val) > self.min_delta
+
+        if improved:
+            self.best_score = current_val
+            self.best_epoch = epoch
+            self.counter    = 0
+            return True
+        else:
+            self.counter += 1
+            if self.verbose:
+                print(
+                    f"  [EarlyStopping] No improvement for {self.counter}/{self.patience} epochs "
+                    f"(Best {self.mode}: {self.best_score:.4f} at epoch {self.best_epoch})"
+                )
+            if self.counter >= self.patience:
+                self.early_stop = True
+                print(
+                    f"\n  [EarlyStopping] TRIGGERED: Validation metric did not improve for {self.patience} "
+                    f"consecutive epochs. Best epoch was {self.best_epoch} ({self.mode}={self.best_score:.4f})."
+                )
+            return False
 
 
 # ==============================================================================
@@ -415,7 +492,11 @@ def load_checkpoint(
 # ==============================================================================
 # Plotting
 # ==============================================================================
-def plot_and_save_training_curves(history: Dict[str, list], output_dir: str = PLOT_DIR):
+def plot_and_save_training_curves(
+    history: Dict[str, list],
+    output_dir: str = PLOT_DIR,
+    epoch: Optional[int] = None,
+):
     os.makedirs(output_dir, exist_ok=True)
 
     train_steps  = history.get("train_step", [])
@@ -481,7 +562,10 @@ def plot_and_save_training_curves(history: Dict[str, list], output_dir: str = PL
             plt.grid(True, ls="--", alpha=0.6); plt.tight_layout()
             plt.savefig(os.path.join(output_dir, "learning_rate.png"), dpi=150); plt.close()
 
-    print(f"--> Plots saved to '{output_dir}/'")
+    if epoch is not None:
+        print(f"  * Saved training curve plots to '{output_dir}/' (epoch {epoch})")
+    else:
+        print(f"--> Plots saved to '{output_dir}/'")
 
 
 # ==============================================================================
@@ -641,6 +725,8 @@ def train(
     checkpoint_dir: str = CHECKPOINT_DIR,
     plot_dir: str = PLOT_DIR,
     vis_samples: int = 4,
+    early_stopping_patience: int = EARLY_STOPPING_PATIENCE,
+    grad_clip: float = GRAD_CLIP_NORM,
 ) -> Dict[str, list]:
 
     if history is None:
@@ -649,12 +735,26 @@ def train(
     train_metrics = SegmentationMetrics(num_classes=NUM_CLASSES, ignore_index=IGNORE_INDEX, device=torch.device(device))
     val_metrics   = SegmentationMetrics(num_classes=NUM_CLASSES, ignore_index=IGNORE_INDEX, device=torch.device(device))
 
+    early_stopping = EarlyStopping(
+        patience=early_stopping_patience,
+        min_delta=EARLY_STOPPING_MIN_DELTA,
+        mode="max" if BEST_METRIC_NAME == "miou" else "min",
+        verbose=True,
+    )
+    if best_epoch > 0:
+        early_stopping.best_score = best_metric_val
+        early_stopping.best_epoch = best_epoch
+
     model = model.to(device)
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(plot_dir, exist_ok=True)
 
     print(f"\nStarting training: epochs {start_epoch}->{epochs} | device={device}")
-    print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}\n")
+    print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
+    if early_stopping_patience > 0:
+        print(f"Early stopping: patience={early_stopping_patience} epochs (monitoring Val {BEST_METRIC_NAME})\n")
+    else:
+        print("Early stopping: disabled\n")
 
     for epoch in range(start_epoch, epochs + 1):
         # ------------------------------------------------------------------
@@ -681,6 +781,8 @@ def train(
             outputs = model(images)
             loss    = criterion(outputs, targets)
             loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             optimizer.step()
 
             step_loss       = loss.item()
@@ -717,6 +819,8 @@ def train(
             "pixel_acc": float(train_ep_m["pixel_acc"]),
             "dice": float(train_ep_m["dice"]),
             "lr": float(cur_lr),
+            "iou_per_class": [float(x) for x in train_ep_m.get("iou_per_class", [])],
+            "dice_per_class": [float(x) for x in train_ep_m.get("dice_per_class", [])],
         })
 
         # ------------------------------------------------------------------
@@ -771,6 +875,8 @@ def train(
             "miou": float(val_ep_m["miou"]),
             "pixel_acc": float(val_ep_m["pixel_acc"]),
             "dice": float(val_ep_m["dice"]),
+            "iou_per_class": [float(x) for x in val_ep_m.get("iou_per_class", [])],
+            "dice_per_class": [float(x) for x in val_ep_m.get("dice_per_class", [])],
         })
 
         # LR step
@@ -795,12 +901,22 @@ def train(
         # Per-class IoU summary (val)
         iou_cls = val_ep_m.get("iou_per_class", [])
         if iou_cls:
-            cls_str = "  Val IoU/class: " + " | ".join(
+            cls_str = "  Val IoU/class:  " + " | ".join(
                 f"{CLASS_NAMES[i]}:{v:.3f}"
                 for i, v in enumerate(iou_cls)
                 if i < len(CLASS_NAMES)
             )
             print(cls_str)
+
+        # Per-class Dice summary (val)
+        dice_cls = val_ep_m.get("dice_per_class", [])
+        if dice_cls:
+            dice_str = "  Val Dice/class: " + " | ".join(
+                f"{CLASS_NAMES[i]}:{v:.3f}"
+                for i, v in enumerate(dice_cls)
+                if i < len(CLASS_NAMES)
+            )
+            print(dice_str)
 
         # ------------------------------------------------------------------
         # Checkpointing
@@ -823,7 +939,7 @@ def train(
             print(f"  * New best! Val {BEST_METRIC_NAME}={best_metric_val:.4f} at epoch {best_epoch}")
 
         # ------------------------------------------------------------------
-        # Visualizations: Save Sample Predictions (image, thermal_image, predicted_mask, true_label)
+        # Visualizations & Training Curves
         # ------------------------------------------------------------------
         save_epoch_predictions(
             model=model,
@@ -834,8 +950,26 @@ def train(
             num_samples=vis_samples,
         )
 
+        plot_and_save_training_curves(
+            history=history,
+            output_dir=plot_dir,
+            epoch=epoch,
+        )
+
+        # ------------------------------------------------------------------
+        # Early Stopping Check
+        # ------------------------------------------------------------------
+        early_stopping.step(current_metric, epoch)
+        if early_stopping.early_stop:
+            print(
+                f"\n--> Early stopping triggered at epoch {epoch}! "
+                f"Halting training early. Best checkpoint is from epoch {best_epoch} "
+                f"with Val {BEST_METRIC_NAME}={best_metric_val:.4f}."
+            )
+            break
+
     # Final plots
-    print("\nGenerating training plots...")
+    print("\nGenerating final training plots...")
     plot_and_save_training_curves(history, output_dir=plot_dir)
 
     return history
@@ -872,6 +1006,16 @@ def parse_args():
                         help="CrossEntropyLoss weighting scheme: 'auto' (cube-root inverse freq), "
                              "'mfb' (median frequency balancing), 'enet' (ENet log-smoothed), "
                              "or 'none' (unweighted)")
+    parser.add_argument("--weight-decay",   type=float, default=WEIGHT_DECAY,
+                        help="Optimizer weight decay for AdamW (increased to prevent overfitting)")
+    parser.add_argument("--label-smoothing", type=float, default=LABEL_SMOOTHING,
+                        help="Label smoothing factor for CrossEntropyLoss to prevent overfitting")
+    parser.add_argument("--patience", "--early-stopping-patience", dest="patience", type=int, default=EARLY_STOPPING_PATIENCE,
+                        help="Early stopping patience in epochs (default 10, set <=0 to disable)")
+    parser.add_argument("--dropout",        type=float, default=DROPOUT_RATE,
+                        help="Spatial Dropout rate in MFNet architecture to prevent overfitting")
+    parser.add_argument("--grad-clip",      type=float, default=GRAD_CLIP_NORM,
+                        help="Max gradient norm clipping for training stability (0 to disable)")
     return parser.parse_args()
 
 
@@ -889,35 +1033,37 @@ def main():
     print("=" * 70)
     print("MFNet RGB+Thermal Semantic Segmentation Training")
     print(f"  Model=MFNet | device={device} | batch={batch_size} | epochs={epochs} | lr={lr}")
+    print(f"  Regularization: weight_decay={args.weight_decay} | label_smoothing={args.label_smoothing} | dropout={args.dropout} | patience={args.patience}")
     print(f"  img_size={img_size} | num_classes={NUM_CLASSES}")
     print("=" * 70)
 
     # 1. Build model (MFNet)
     if build_model is None:
         raise RuntimeError("Cannot import build_model from model.py")
-    model = build_model(num_classes=NUM_CLASSES)
+    model = build_model(num_classes=NUM_CLASSES, dropout_rate=args.dropout)
     model = model.to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model: MFNet | Trainable params: {n_params:,}")
+    print(f"Model: MFNet (dropout={args.dropout}) | Trainable params: {n_params:,}")
 
     # 2. Optimizer, scheduler, loss
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
     class_weights = get_class_weights(method=args.class_weights, num_classes=NUM_CLASSES, device=device)
     if class_weights is not None:
-        print(f"\nWeighted CrossEntropyLoss ({args.class_weights}):")
+        print(f"\nWeighted CrossEntropyLoss ({args.class_weights}) with label_smoothing={args.label_smoothing}:")
         for i, name in enumerate(CLASS_NAMES):
             w_val = class_weights[i].item() if i < len(class_weights) else 1.0
             print(f"  Class {i} ({name:12s}): weight = {w_val:.4f}")
         print()
     else:
-        print("\nUsing unweighted CrossEntropyLoss.\n")
+        print(f"\nUsing unweighted CrossEntropyLoss with label_smoothing={args.label_smoothing}.\n")
 
     criterion = CombinedLoss(
         num_classes=NUM_CLASSES,
         ignore_index=IGNORE_INDEX,
         class_weights=class_weights,
+        label_smoothing=args.label_smoothing,
     )
 
     # 3. Resume
@@ -980,6 +1126,8 @@ def main():
         checkpoint_dir=ckpt_dir,
         plot_dir=plot_dir,
         vis_samples=args.vis_samples,
+        early_stopping_patience=args.patience,
+        grad_clip=args.grad_clip,
     )
 
 

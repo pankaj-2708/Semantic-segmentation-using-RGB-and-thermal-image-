@@ -12,8 +12,9 @@ import torch.nn.functional as F
 # ==========================================
 # Global Parameters / Configuration
 # ==========================================
-IN_CHANNELS = 4       # 3 RGB + 1 Thermal
-NUM_CLASSES = 9       # MFNet has 9 classes (0-8)
+IN_CHANNELS  = 4       # 3 RGB + 1 Thermal
+NUM_CLASSES  = 9       # MFNet has 9 classes (0-8)
+DROPOUT_RATE = 0.2     # Spatial Dropout rate to prevent overfitting
 
 
 class ConvBnLeakyRelu2d(nn.Module):
@@ -56,9 +57,10 @@ class MFNet(nn.Module):
     Output: [B, n_class, H, W] class segmentation logits.
     """
 
-    def __init__(self, n_class=NUM_CLASSES):
+    def __init__(self, n_class=NUM_CLASSES, dropout_rate: float = DROPOUT_RATE):
         super(MFNet, self).__init__()
         self.n_class = n_class
+        self.dropout_rate = dropout_rate
         rgb_ch = [16, 48, 48, 96, 96]
         inf_ch = [16, 16, 16, 36, 36]
 
@@ -79,6 +81,18 @@ class MFNet(nn.Module):
         self.conv3_2_inf = ConvBnLeakyRelu2d(inf_ch[2], inf_ch[2])
         self.conv4_inf   = MiniInception(inf_ch[2], inf_ch[3])
         self.conv5_inf   = MiniInception(inf_ch[3], inf_ch[4])
+
+        # Dropout regularization (Spatial Dropout2d zeroes out full channels to prevent overfitting)
+        if dropout_rate > 0.0:
+            self.drop_fuse = nn.Dropout2d(p=dropout_rate)
+            self.drop_dec4 = nn.Dropout2d(p=dropout_rate)
+            self.drop_dec3 = nn.Dropout2d(p=dropout_rate)
+            self.drop_dec2 = nn.Dropout2d(p=dropout_rate)
+        else:
+            self.drop_fuse = nn.Identity()
+            self.drop_dec4 = nn.Identity()
+            self.drop_dec3 = nn.Identity()
+            self.drop_dec2 = nn.Identity()
 
         # Fused Decoder
         self.decode4     = ConvBnLeakyRelu2d(rgb_ch[3] + inf_ch[3], rgb_ch[2] + inf_ch[2])
@@ -119,14 +133,18 @@ class MFNet(nn.Module):
 
         # Fusion: concatenate RGB and Thermal feature maps
         x = torch.cat((x_rgb, x_inf), dim=1)
+        x = self.drop_fuse(x)
 
         # Decode with skip connections (using F.interpolate for PyTorch compatibility)
         x = F.interpolate(x, scale_factor=2, mode='nearest') # unpool4
         x = self.decode4(x + torch.cat((x_rgb_p4, x_inf_p4), dim=1))
+        x = self.drop_dec4(x)
         x = F.interpolate(x, scale_factor=2, mode='nearest') # unpool3
         x = self.decode3(x + torch.cat((x_rgb_p3, x_inf_p3), dim=1))
+        x = self.drop_dec3(x)
         x = F.interpolate(x, scale_factor=2, mode='nearest') # unpool2
         x = self.decode2(x + torch.cat((x_rgb_p2, x_inf_p2), dim=1))
+        x = self.drop_dec2(x)
         x = F.interpolate(x, scale_factor=2, mode='nearest') # unpool1
         x = self.decode1(x)
 
@@ -135,12 +153,13 @@ class MFNet(nn.Module):
 
 def build_model(
     num_classes: int = NUM_CLASSES,
+    dropout_rate: float = DROPOUT_RATE,
     **kwargs,
 ) -> nn.Module:
     """
-    Build and return the MFNet segmentation model.
+    Build and return the MFNet segmentation model with optional dropout regularization.
     """
-    return MFNet(n_class=num_classes)
+    return MFNet(n_class=num_classes, dropout_rate=dropout_rate)
 
 
 def unit_test():
