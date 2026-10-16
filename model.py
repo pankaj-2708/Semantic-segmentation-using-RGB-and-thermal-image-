@@ -14,7 +14,7 @@ import torch.nn.functional as F
 # ==========================================
 IN_CHANNELS  = 4       # 3 RGB + 1 Thermal
 NUM_CLASSES  = 9       # MFNet has 9 classes (0-8)
-DROPOUT_RATE = 0.2     # Spatial Dropout rate to prevent overfitting
+DROPOUT_RATE = 0.3     # Spatial Dropout rate to prevent overfitting
 
 
 class ConvBnLeakyRelu2d(nn.Module):
@@ -84,15 +84,20 @@ class MFNet(nn.Module):
 
         # Dropout regularization (Spatial Dropout2d zeroes out full channels to prevent overfitting)
         if dropout_rate > 0.0:
-            self.drop_fuse = nn.Dropout2d(p=dropout_rate)
-            self.drop_dec4 = nn.Dropout2d(p=dropout_rate)
-            self.drop_dec3 = nn.Dropout2d(p=dropout_rate)
-            self.drop_dec2 = nn.Dropout2d(p=dropout_rate)
+            enc_p = dropout_rate * 0.7
+            self.drop_enc_rgb = nn.Dropout2d(p=enc_p)
+            self.drop_enc_inf = nn.Dropout2d(p=enc_p)
+            self.drop_fuse    = nn.Dropout2d(p=dropout_rate)
+            self.drop_dec4    = nn.Dropout2d(p=dropout_rate)
+            self.drop_dec3    = nn.Dropout2d(p=dropout_rate)
+            self.drop_dec2    = nn.Dropout2d(p=dropout_rate)
         else:
-            self.drop_fuse = nn.Identity()
-            self.drop_dec4 = nn.Identity()
-            self.drop_dec3 = nn.Identity()
-            self.drop_dec2 = nn.Identity()
+            self.drop_enc_rgb = nn.Identity()
+            self.drop_enc_inf = nn.Identity()
+            self.drop_fuse    = nn.Identity()
+            self.drop_dec4    = nn.Identity()
+            self.drop_dec3    = nn.Identity()
+            self.drop_dec2    = nn.Identity()
 
         # Fused Decoder
         self.decode4     = ConvBnLeakyRelu2d(rgb_ch[3] + inf_ch[3], rgb_ch[2] + inf_ch[2])
@@ -117,6 +122,7 @@ class MFNet(nn.Module):
         x_rgb_p4 = self.conv4_rgb(x_rgb)
         x_rgb    = F.max_pool2d(x_rgb_p4, kernel_size=2, stride=2) # pool4
         x_rgb    = self.conv5_rgb(x_rgb)
+        x_rgb    = self.drop_enc_rgb(x_rgb)
 
         # Encode Thermal (INF)
         x_inf    = self.conv1_inf(x_inf)
@@ -130,6 +136,7 @@ class MFNet(nn.Module):
         x_inf_p4 = self.conv4_inf(x_inf)
         x_inf    = F.max_pool2d(x_inf_p4, kernel_size=2, stride=2) # pool4
         x_inf    = self.conv5_inf(x_inf)
+        x_inf    = self.drop_enc_inf(x_inf)
 
         # Fusion: concatenate RGB and Thermal feature maps
         x = torch.cat((x_rgb, x_inf), dim=1)

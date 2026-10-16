@@ -58,17 +58,20 @@ TQDM_SMOOTHING    = 0.1
 NUM_CLASSES              = 9          # MFNet: 0=Unlabeled, 1-8 objects
 IN_CHANNELS              = 4          # RGB (3) + Thermal (1)
 IGNORE_INDEX             = 255
-BATCH_SIZE               = 24
-EPOCHS                   = 50
+BATCH_SIZE               = 36
+EPOCHS                   = 60
 LEARNING_RATE            = 1e-3
-WEIGHT_DECAY             = 1e-2       # Increased weight decay (L2 regularization) to prevent overfitting
+WEIGHT_DECAY             = 2e-2       # Increased weight decay (L2 regularization) to prevent overfitting
 LABEL_SMOOTHING          = 0.1        # Label smoothing factor to prevent overconfident predictions
 EARLY_STOPPING_PATIENCE  = 10         # Early stopping patience (epochs without validation improvement)
 EARLY_STOPPING_MIN_DELTA = 1e-4       # Minimum delta threshold to count as metric improvement
-DROPOUT_RATE             = 0.2        # Spatial Dropout rate to prevent co-adaptation & overfitting
+DROPOUT_RATE             = 0.3        # Spatial Dropout rate to prevent co-adaptation & overfitting
 GRAD_CLIP_NORM           = 10.0       # Max gradient norm clipping for training stability
+ETA_MIN                  = 1e-5       # Minimum LR floor for CosineAnnealing to avoid overfitting tail memorization
+USE_AMP                  = True       # Automatic Mixed Precision (FP16) on CUDA
+USE_COMPILE              = True       # PyTorch Inductor kernel compilation (torch.compile)
 ARCH                     = "mfnet"
-DEVICE                   = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE                   = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 CHECKPOINT_DIR    = "checkpoints"
 PLOT_DIR          = "plots"
@@ -424,7 +427,7 @@ def save_checkpoint(
     best_epoch: int,
 ):
     os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
-    raw_model = model.module if hasattr(model, "module") else model
+    raw_model = model._orig_mod if hasattr(model, "_orig_mod") else (model.module if hasattr(model, "module") else model)
     torch.save(
         {
             "epoch":               epoch,
@@ -458,8 +461,12 @@ def load_checkpoint(
         raise FileNotFoundError(f"Checkpoint not found: '{filepath}'")
 
     ckpt = torch.load(filepath, map_location=device, weights_only=False)
-    raw  = model.module if hasattr(model, "module") else model
-    raw.load_state_dict(ckpt["model_state_dict"])
+    state_dict = ckpt["model_state_dict"]
+    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+
+    raw = model._orig_mod if hasattr(model, "_orig_mod") else (model.module if hasattr(model, "module") else model)
+    raw.load_state_dict(state_dict)
 
     if optimizer and ckpt.get("optimizer_state_dict"):
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -596,30 +603,28 @@ def _mask_to_rgb(mask_2d: np.ndarray, num_classes: int = NUM_CLASSES) -> np.ndar
     return rgb
 
 
-def save_epoch_predictions(
-    model: nn.Module,
-    val_loader: DataLoader,
-    epoch: int,
-    device: str = DEVICE,
-    output_dir: str = PLOT_DIR,
-    num_samples: int = 4,
-):
+def _create_overlay(rgb: np.ndarray, mask_2d: np.ndarray, alpha: float = 0.45) -> np.ndarray:
     """
-    Saves a comparison image showing 4-8 samples with:
-    [image, thermal_image, predicted_mask, true_label] side-by-side.
+    Blends color-coded semantic mask on top of the RGB image.
+    Background (class 0) and ignore index pixels are left natural and visible.
     """
-    os.makedirs(output_dir, exist_ok=True)
-    raw_model = model.module if hasattr(model, "module") else model
-    raw_model.eval()
+    mask_rgb = _mask_to_rgb(mask_2d, num_classes=NUM_CLASSES).astype(np.float32) / 255.0
+    overlay = rgb.copy()
+    valid_obj = (mask_2d > 0) & (mask_2d < NUM_CLASSES) & (mask_2d != IGNORE_INDEX)
+    overlay[valid_obj] = (1.0 - alpha) * rgb[valid_obj] + alpha * mask_rgb[valid_obj]
+    return np.clip(overlay, 0.0, 1.0)
 
-    num_samples = max(4, min(8, num_samples))
+
+def _collect_samples(model: nn.Module, loader: DataLoader, device: str, num_samples: int):
+    raw_model = model._orig_mod if hasattr(model, "_orig_mod") else (model.module if hasattr(model, "module") else model)
+    raw_model.eval()
     collected_images = []
     collected_targets = []
     collected_preds = []
 
     with torch.no_grad():
-        for images, targets in val_loader:
-            images = images.to(device)
+        for images, targets in loader:
+            images = images.to(device, non_blocking=True)
             outputs = raw_model(images)
             preds = torch.argmax(outputs, dim=1)
 
@@ -632,19 +637,18 @@ def save_epoch_predictions(
                     break
             if len(collected_images) >= num_samples:
                 break
+    return collected_images, collected_targets, collected_preds
 
+
+def _draw_sample_rows(axes, row_offset: int, collected_images, collected_targets, collected_preds, row_prefix: str = "Sample"):
     n = len(collected_images)
-    if n == 0:
-        return
-
-    fig, axes = plt.subplots(n, 4, figsize=(16, 3.2 * n), squeeze=False)
-
     for i in range(n):
+        r = row_offset + i
         img_4ch = collected_images[i].numpy()   # (4, H, W)
         pred_2d = collected_preds[i].numpy()    # (H, W)
         gt_2d   = collected_targets[i].numpy()  # (H, W)
 
-        # 1. Original RGB image (channels 0:3) without mean/std distortion
+        # 1. Original RGB image (channels 0:3)
         rgb = img_4ch[:3].transpose(1, 2, 0)    # (H, W, 3)
         if rgb.max() > 1.5:
             rgb = rgb / 255.0
@@ -659,27 +663,49 @@ def save_epoch_predictions(
         # 3. Predicted Mask (color-coded)
         pred_rgb = _mask_to_rgb(pred_2d, num_classes=NUM_CLASSES)
 
-        # 4. True Label Mask (color-coded)
+        # 4. Predicted Overlay on RGB image
+        pred_overlay = _create_overlay(rgb, pred_2d, alpha=0.45)
+
+        # 5. True Label Mask (color-coded)
         gt_rgb = _mask_to_rgb(gt_2d, num_classes=NUM_CLASSES)
 
-        axes[i, 0].imshow(rgb)
-        axes[i, 0].set_ylabel(f"Sample {i + 1}", fontsize=11, fontweight="bold")
-        axes[i, 0].set_xticks([]); axes[i, 0].set_yticks([])
+        # 6. True Label Overlay on RGB image
+        gt_overlay = _create_overlay(rgb, gt_2d, alpha=0.45)
 
-        axes[i, 1].imshow(thermal, cmap="gray")
-        axes[i, 1].set_xticks([]); axes[i, 1].set_yticks([])
+        axes[r, 0].imshow(rgb)
+        axes[r, 0].set_ylabel(f"{row_prefix} {i + 1}", fontsize=11, fontweight="bold")
+        axes[r, 0].set_xticks([]); axes[r, 0].set_yticks([])
 
-        axes[i, 2].imshow(pred_rgb)
-        axes[i, 2].set_xticks([]); axes[i, 2].set_yticks([])
+        axes[r, 1].imshow(thermal, cmap="gray")
+        axes[r, 1].set_xticks([]); axes[r, 1].set_yticks([])
 
-        axes[i, 3].imshow(gt_rgb)
-        axes[i, 3].set_xticks([]); axes[i, 3].set_yticks([])
+        axes[r, 2].imshow(pred_rgb)
+        axes[r, 2].set_xticks([]); axes[r, 2].set_yticks([])
 
-    axes[0, 0].set_title("image", fontsize=13, fontweight="bold")
-    axes[0, 1].set_title("thermal_image", fontsize=13, fontweight="bold")
-    axes[0, 2].set_title("predicted_mask", fontsize=13, fontweight="bold")
-    axes[0, 3].set_title("true_label", fontsize=13, fontweight="bold")
+        axes[r, 3].imshow(pred_overlay)
+        axes[r, 3].set_xticks([]); axes[r, 3].set_yticks([])
 
+        axes[r, 4].imshow(gt_rgb)
+        axes[r, 4].set_xticks([]); axes[r, 4].set_yticks([])
+
+        axes[r, 5].imshow(gt_overlay)
+        axes[r, 5].set_xticks([]); axes[r, 5].set_yticks([])
+
+
+def _set_column_headers(axes):
+    col_titles = [
+        "image",
+        "thermal_image",
+        "predicted_mask",
+        "pred_overlay",
+        "true_label",
+        "true_overlay",
+    ]
+    for c, title in enumerate(col_titles):
+        axes[0, c].set_title(title, fontsize=13, fontweight="bold")
+
+
+def _add_legend(fig):
     legend_patches = [
         mpatches.Patch(color=np.array(MFNET_COLORMAP[c]) / 255.0, label=CLASS_NAMES[c])
         for c in range(min(NUM_CLASSES, len(CLASS_NAMES)))
@@ -693,16 +719,86 @@ def save_epoch_predictions(
         frameon=True,
     )
 
-    plt.suptitle(f"Epoch {epoch:02d} Sample Predictions", fontsize=15, fontweight="bold", y=0.995)
-    plt.tight_layout(rect=[0, 0.04, 1, 0.99])
 
-    epoch_save_path = os.path.join(output_dir, f"epoch_{epoch:03d}_predictions.png")
-    latest_save_path = os.path.join(output_dir, "latest_predictions.png")
-    plt.savefig(epoch_save_path, dpi=150, bbox_inches="tight")
-    plt.savefig(latest_save_path, dpi=150, bbox_inches="tight")
-    plt.close()
+def save_epoch_predictions(
+    model: nn.Module,
+    val_loader: DataLoader,
+    train_loader: Optional[DataLoader] = None,
+    epoch: int = 1,
+    device: str = DEVICE,
+    output_dir: str = PLOT_DIR,
+    num_samples: int = 4,
+):
+    """
+    Saves high-resolution 6-column comparison images with:
+    [image, thermal_image, predicted_mask, pred_overlay, true_label, true_overlay].
 
-    print(f"  * Saved sample predictions: '{epoch_save_path}'")
+    Generates:
+      - epoch_{epoch:03d}_val_predictions.png & latest_val_predictions.png
+      - epoch_{epoch:03d}_train_predictions.png & latest_train_predictions.png (if train_loader provided)
+      - epoch_{epoch:03d}_predictions.png & latest_predictions.png (combined Train + Val)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    num_samples = max(4, min(8, num_samples))
+
+    # 1. Validation samples
+    val_imgs, val_tgts, val_prds = _collect_samples(model, val_loader, device, num_samples)
+    n_val = len(val_imgs)
+    if n_val > 0:
+        fig_val, axes_val = plt.subplots(n_val, 6, figsize=(22, 3.2 * n_val), squeeze=False)
+        _draw_sample_rows(axes_val, 0, val_imgs, val_tgts, val_prds, row_prefix="Val")
+        _set_column_headers(axes_val)
+        _add_legend(fig_val)
+        plt.suptitle(f"Epoch {epoch:02d} Validation Sample Predictions & Overlays", fontsize=15, fontweight="bold", y=0.995)
+        plt.tight_layout(rect=[0, 0.04, 1, 0.99])
+
+        val_save_path = os.path.join(output_dir, f"epoch_{epoch:03d}_val_predictions.png")
+        latest_val_path = os.path.join(output_dir, "latest_val_predictions.png")
+        plt.savefig(val_save_path, dpi=150, bbox_inches="tight")
+        plt.savefig(latest_val_path, dpi=150, bbox_inches="tight")
+        plt.close(fig_val)
+
+    # 2. Training samples
+    tr_imgs, tr_tgts, tr_prds = [], [], []
+    if train_loader is not None:
+        tr_imgs, tr_tgts, tr_prds = _collect_samples(model, train_loader, device, num_samples)
+        n_tr = len(tr_imgs)
+        if n_tr > 0:
+            fig_tr, axes_tr = plt.subplots(n_tr, 6, figsize=(22, 3.2 * n_tr), squeeze=False)
+            _draw_sample_rows(axes_tr, 0, tr_imgs, tr_tgts, tr_prds, row_prefix="Train")
+            _set_column_headers(axes_tr)
+            _add_legend(fig_tr)
+            plt.suptitle(f"Epoch {epoch:02d} Training Sample Predictions & Overlays", fontsize=15, fontweight="bold", y=0.995)
+            plt.tight_layout(rect=[0, 0.04, 1, 0.99])
+
+            train_save_path = os.path.join(output_dir, f"epoch_{epoch:03d}_train_predictions.png")
+            latest_tr_path = os.path.join(output_dir, "latest_train_predictions.png")
+            plt.savefig(train_save_path, dpi=150, bbox_inches="tight")
+            plt.savefig(latest_tr_path, dpi=150, bbox_inches="tight")
+            plt.close(fig_tr)
+
+    # 3. Combined comparison figure (Train on top, Val on bottom)
+    total_samples = len(tr_imgs) + len(val_imgs)
+    if total_samples > 0:
+        fig_comb, axes_comb = plt.subplots(total_samples, 6, figsize=(22, 3.2 * total_samples + 0.6), squeeze=False)
+        offset = 0
+        if len(tr_imgs) > 0:
+            _draw_sample_rows(axes_comb, 0, tr_imgs, tr_tgts, tr_prds, row_prefix="Train")
+            offset += len(tr_imgs)
+        if len(val_imgs) > 0:
+            _draw_sample_rows(axes_comb, offset, val_imgs, val_tgts, val_prds, row_prefix="Val")
+        _set_column_headers(axes_comb)
+        _add_legend(fig_comb)
+        plt.suptitle(f"Epoch {epoch:02d} Predictions & Overlays (Train & Validation)", fontsize=15, fontweight="bold", y=0.995)
+        plt.tight_layout(rect=[0, 0.04, 1, 0.99])
+
+        epoch_save_path = os.path.join(output_dir, f"epoch_{epoch:03d}_predictions.png")
+        latest_save_path = os.path.join(output_dir, "latest_predictions.png")
+        plt.savefig(epoch_save_path, dpi=150, bbox_inches="tight")
+        plt.savefig(latest_save_path, dpi=150, bbox_inches="tight")
+        plt.close(fig_comb)
+
+        print(f"  * Saved sample predictions & overlays: '{epoch_save_path}', '{output_dir}/epoch_{epoch:03d}_val_predictions.png', '{output_dir}/epoch_{epoch:03d}_train_predictions.png'")
 
 
 # ==============================================================================
@@ -727,6 +823,8 @@ def train(
     vis_samples: int = 4,
     early_stopping_patience: int = EARLY_STOPPING_PATIENCE,
     grad_clip: float = GRAD_CLIP_NORM,
+    use_amp: bool = USE_AMP,
+    compile_model: bool = USE_COMPILE,
 ) -> Dict[str, list]:
 
     if history is None:
@@ -746,10 +844,21 @@ def train(
         early_stopping.best_epoch = best_epoch
 
     model = model.to(device)
+    if "cuda" in device:
+        torch.backends.cudnn.benchmark = True
+
+    scaler = torch.amp.GradScaler("cuda") if (use_amp and "cuda" in device) else None
+
+    if compile_model and "cuda" in device:
+        print("[train.py] Compiling model with torch.compile(mode='default')...")
+        exec_model = torch.compile(model, mode="default")
+    else:
+        exec_model = model
+
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(plot_dir, exist_ok=True)
 
-    print(f"\nStarting training: epochs {start_epoch}->{epochs} | device={device}")
+    print(f"\nStarting training: epochs {start_epoch}->{epochs} | device={device} | AMP={scaler is not None} | compile={exec_model is not model}")
     print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
     if early_stopping_patience > 0:
         print(f"Early stopping: patience={early_stopping_patience} epochs (monitoring Val {BEST_METRIC_NAME})\n")
@@ -760,7 +869,7 @@ def train(
         # ------------------------------------------------------------------
         # TRAIN
         # ------------------------------------------------------------------
-        model.train()
+        exec_model.train()
         train_metrics.reset()
         run_loss_sum, n_samples = 0.0, 0
 
@@ -777,13 +886,24 @@ def train(
             targets = targets.to(device, non_blocking=True)
             bs      = images.size(0)
 
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss    = criterion(outputs, targets)
-            loss.backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if scaler is not None:
+                with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                    outputs = exec_model(images)
+                    loss    = criterion(outputs, targets)
+                scaler.scale(loss).backward()
+                if grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = exec_model(images)
+                loss    = criterion(outputs, targets)
+                loss.backward()
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+                optimizer.step()
 
             step_loss       = loss.item()
             run_loss_sum   += step_loss * bs
@@ -826,7 +946,7 @@ def train(
         # ------------------------------------------------------------------
         # VALIDATION
         # ------------------------------------------------------------------
-        model.eval()
+        exec_model.eval()
         val_metrics.reset()
         val_loss_sum, val_n = 0.0, 0
 
@@ -844,8 +964,14 @@ def train(
                 targets = targets.to(device, non_blocking=True)
                 bs      = images.size(0)
 
-                outputs   = model(images)
-                loss      = criterion(outputs, targets)
+                if scaler is not None:
+                    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                        outputs   = exec_model(images)
+                        loss      = criterion(outputs, targets)
+                else:
+                    outputs   = exec_model(images)
+                    loss      = criterion(outputs, targets)
+
                 step_loss = loss.item()
                 val_loss_sum += step_loss * bs
                 val_n        += bs
@@ -939,11 +1065,12 @@ def train(
             print(f"  * New best! Val {BEST_METRIC_NAME}={best_metric_val:.4f} at epoch {best_epoch}")
 
         # ------------------------------------------------------------------
-        # Visualizations & Training Curves
+        # Visualizations & Training Curves (Train and Val with Overlays)
         # ------------------------------------------------------------------
         save_epoch_predictions(
             model=model,
             val_loader=val_loader,
+            train_loader=train_loader,
             epoch=epoch,
             device=device,
             output_dir=plot_dir,
@@ -996,18 +1123,18 @@ def parse_args():
                              "'restart' (fresh cosine decay over remaining epochs)")
     parser.add_argument("--checkpoint-dir", type=str, default=CHECKPOINT_DIR)
     parser.add_argument("--plot-dir",       type=str, default=PLOT_DIR)
-    parser.add_argument("--num-workers",    type=int, default=2)
+    parser.add_argument("--num-workers",    type=int, default=4)
     parser.add_argument("--img-h",          type=int, default=480)
     parser.add_argument("--img-w",          type=int, default=640)
     parser.add_argument("--vis-samples",    type=int, default=4,
-                        help="Number of samples (4-8) to visualize after each epoch (image, thermal_image, predicted_mask, true_label)")
+                        help="Number of samples (4-8) to visualize after each epoch with 6-column overlays")
     parser.add_argument("--class-weights",  type=str, default="auto",
                         choices=["auto", "mfb", "enet", "none"],
                         help="CrossEntropyLoss weighting scheme: 'auto' (cube-root inverse freq), "
                              "'mfb' (median frequency balancing), 'enet' (ENet log-smoothed), "
                              "or 'none' (unweighted)")
     parser.add_argument("--weight-decay",   type=float, default=WEIGHT_DECAY,
-                        help="Optimizer weight decay for AdamW (increased to prevent overfitting)")
+                        help="Optimizer weight decay for AdamW (regularizes 2D conv kernels)")
     parser.add_argument("--label-smoothing", type=float, default=LABEL_SMOOTHING,
                         help="Label smoothing factor for CrossEntropyLoss to prevent overfitting")
     parser.add_argument("--patience", "--early-stopping-patience", dest="patience", type=int, default=EARLY_STOPPING_PATIENCE,
@@ -1016,13 +1143,21 @@ def parse_args():
                         help="Spatial Dropout rate in MFNet architecture to prevent overfitting")
     parser.add_argument("--grad-clip",      type=float, default=GRAD_CLIP_NORM,
                         help="Max gradient norm clipping for training stability (0 to disable)")
+    parser.add_argument("--eta-min",        type=float, default=ETA_MIN,
+                        help="Minimum learning rate floor for CosineAnnealingLR")
+    parser.add_argument("--compile",        action=argparse.BooleanOptionalAction, default=USE_COMPILE,
+                        help="Enable/disable torch.compile Inductor kernel acceleration")
+    parser.add_argument("--amp",            action=argparse.BooleanOptionalAction, default=USE_AMP,
+                        help="Enable/disable Automatic Mixed Precision (FP16)")
+    parser.add_argument("--device",         type=str, default=DEVICE,
+                        help="Target device (strictly single GPU, e.g. cuda:0 or cpu)")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
-    device       = DEVICE
+    device       = args.device
     batch_size   = args.batch_size
     epochs       = args.epochs
     lr           = args.lr
@@ -1033,8 +1168,9 @@ def main():
     print("=" * 70)
     print("MFNet RGB+Thermal Semantic Segmentation Training")
     print(f"  Model=MFNet | device={device} | batch={batch_size} | epochs={epochs} | lr={lr}")
+    print(f"  Acceleration: compile={args.compile} | AMP={args.amp} | workers={args.num_workers}")
     print(f"  Regularization: weight_decay={args.weight_decay} | label_smoothing={args.label_smoothing} | dropout={args.dropout} | patience={args.patience}")
-    print(f"  img_size={img_size} | num_classes={NUM_CLASSES}")
+    print(f"  img_size={img_size} | num_classes={NUM_CLASSES} | eta_min={args.eta_min}")
     print("=" * 70)
 
     # 1. Build model (MFNet)
@@ -1045,9 +1181,23 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model: MFNet (dropout={args.dropout}) | Trainable params: {n_params:,}")
 
-    # 2. Optimizer, scheduler, loss
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    # 2. Decoupled Optimizer, scheduler, loss
+    decay_params = []
+    no_decay_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim <= 1 or name.endswith(".bias"):
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    optim_groups = [
+        {"params": decay_params, "weight_decay": args.weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+    optimizer = torch.optim.AdamW(optim_groups, lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=args.eta_min)
 
     class_weights = get_class_weights(method=args.class_weights, num_classes=NUM_CLASSES, device=device)
     if class_weights is not None:
@@ -1081,16 +1231,16 @@ def main():
 
         remaining_epochs = max(1, epochs - start_epoch + 1)
         if args.lr_mode == "keep_min":
-            print(f"[train.py] LR Mode 'keep_min': keeping LR fixed at minimum (1e-6) for fine-tuning.")
+            print(f"[train.py] LR Mode 'keep_min': keeping LR fixed at minimum ({args.eta_min}) for fine-tuning.")
             for param_group in optimizer.param_groups:
-                param_group["lr"] = 1e-6
+                param_group["lr"] = args.eta_min
             scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=remaining_epochs)
         elif args.lr_mode == "restart":
             restart_lr = args.lr if args.lr != LEARNING_RATE else 1e-4
             print(f"[train.py] LR Mode 'restart': starting fresh Cosine decay from {restart_lr} over remaining {remaining_epochs} epochs.")
             for param_group in optimizer.param_groups:
                 param_group["lr"] = restart_lr
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_epochs, eta_min=1e-6)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_epochs, eta_min=args.eta_min)
         else:  # "rescale" (default)
             if scheduler is not None and hasattr(scheduler, "T_max"):
                 print(f"[train.py] LR Mode 'rescale': updating scheduler T_max to total epochs={epochs}")
@@ -1128,6 +1278,8 @@ def main():
         vis_samples=args.vis_samples,
         early_stopping_patience=args.patience,
         grad_clip=args.grad_clip,
+        use_amp=args.amp,
+        compile_model=args.compile,
     )
 
 

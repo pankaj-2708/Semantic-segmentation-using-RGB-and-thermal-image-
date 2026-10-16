@@ -48,7 +48,7 @@ IMAGE_SIZE   = (IMAGE_HEIGHT, IMAGE_WIDTH)
 NUM_CLASSES  = 9         # MFNet: 0-8
 IN_CHANNELS  = 4         # 3 RGB + 1 Thermal
 IGNORE_INDEX = 255
-NUM_WORKERS  = 2
+NUM_WORKERS  = 4
 
 # Normalisation stats for RGB channels (ImageNet-like)
 RGB_MEAN = [0.485, 0.456, 0.406]
@@ -268,8 +268,16 @@ class MFNetDataset(Dataset):
                 self._transform = A.Compose([
                     A.Resize(self.img_size[0], self.img_size[1]),
                     A.HorizontalFlip(p=0.5),
-                    A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15, p=0.4),
-                    A.Affine(scale=(0.95, 1.05), translate_percent=(-0.04, 0.04), rotate=(-8, 8), border_mode=0, p=0.4),
+                    A.RandomBrightnessContrast(brightness_limit=0.20, contrast_limit=0.20, p=0.5),
+                    A.Affine(scale=(0.85, 1.15), translate_percent=(-0.06, 0.06), rotate=(-12, 12), border_mode=0, p=0.5),
+                    A.CoarseDropout(
+                        num_holes_range=(2, 6),
+                        hole_height_range=(16, 48),
+                        hole_width_range=(16, 48),
+                        fill=0,
+                        fill_mask=self.ignore_index,
+                        p=0.35,
+                    ),
                     A.GaussianBlur(blur_limit=(3, 5), p=0.2),
                     ToTensorV2(),
                 ])
@@ -356,11 +364,24 @@ def get_dataloaders(
         auto_download:     Whether to attempt auto-download if missing.
     """
     if not _dataset_is_ready(data_root):
-        nested = os.path.join(data_root, "ir_seg_dataset")
-        if _dataset_is_ready(nested):
-            data_root = nested
-        elif auto_download:
+        kaggle_candidates = [
+            data_root,
+            os.path.join(data_root, "ir_seg_dataset"),
+            "/kaggle/input/datasets/danialqashqai/mfnet-dataset/MFNet-dataset/ir_seg_dataset",
+            "/kaggle/input/mfnet-dataset/MFNet-dataset/ir_seg_dataset",
+            os.path.join(os.path.dirname(os.path.abspath(data_root)), "MFNet_dataset", "ir_seg_dataset"),
+            os.path.join(os.path.dirname(os.path.abspath(data_root)), "MFNet_dataset"),
+        ]
+        found = False
+        for cand in kaggle_candidates:
+            if os.path.exists(cand) and _dataset_is_ready(cand):
+                data_root = cand
+                found = True
+                break
+
+        if not found and auto_download:
             ensure_dataset(data_root)
+            nested = os.path.join(data_root, "ir_seg_dataset")
             if not _dataset_is_ready(data_root) and _dataset_is_ready(nested):
                 data_root = nested
 
@@ -385,6 +406,7 @@ def get_dataloaders(
     )
 
     pin = torch.cuda.is_available()
+    persistent = (num_workers > 0)
 
     train_loader = DataLoader(
         train_ds,
@@ -392,6 +414,7 @@ def get_dataloaders(
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin,
+        persistent_workers=persistent,
         drop_last=True,
     )
     val_loader = DataLoader(
@@ -400,6 +423,7 @@ def get_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin,
+        persistent_workers=persistent,
         drop_last=False,
     )
 
