@@ -5,4 +5,4 @@ pillow>=9.0.0
 matplotlib>=3.5.0
 tqdm>=4.64.0
 streamlit>=1.25.0
-opencv-python-headless>=4.7.0
+
